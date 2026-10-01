@@ -5,5 +5,5 @@
 # Сборка
 bin/
 coverage.out
-trip-service
+/trip-service
 .DS_Store
