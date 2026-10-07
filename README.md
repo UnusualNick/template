@@ -196,3 +196,4 @@ docker run --rm --env-file .env -p 8080:8080 tripgo-trip-service
 
 Образ собирается в два этапа. Финальный слой основан на distroless, не содержит
 исходников и Go toolchain и запускается от non-root пользователя.
+Размер итогового образа — 19.7 MB при сборке для `linux/arm64`.
