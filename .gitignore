@@ -4,5 +4,7 @@
 
 # Сборка
 bin/
-
+.bin/
+coverage.out
+/trip-service
 .DS_Store

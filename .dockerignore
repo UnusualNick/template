@@ -1,0 +1,7 @@
+.git
+.env
+.tripgo
+bin
+coverage.out
+**/*_test.go
+README.md
