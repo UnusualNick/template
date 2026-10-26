@@ -1,4 +1,4 @@
-# TripGo — лабораторная работа №1
+# TripGo — лабораторная работа №2
 
 HTTP-сервис поездок для курса «Разработка микросервисов на Go». Реализованы
 создание, получение и завершение поездки, хранение в PostgreSQL, история смены
@@ -8,7 +8,7 @@ HTTP-сервис поездок для курса «Разработка мик
 
 - Go 1.24 или новее;
 - `tripgoctl` из репозитория инфраструктуры курса;
-- PostgreSQL, поднятый через `tripgoctl`;
+- PostgreSQL и observability-коллектор, поднятые через `tripgoctl`;
 - `golangci-lint` для `make lint`.
 
 Все Go-инструменты (`oapi-codegen`, `goose`) закреплены в `go.mod` и запускаются
@@ -21,8 +21,10 @@ tripgoctl cluster start
 tripgoctl environment start
 tripgoctl connect
 
-# environment start создаёт .env с актуальным DATABASE_URL.
+# environment start создаёт .env с актуальными адресами; .env.example задаёт
+# обязательные HTTP-таймауты, которых нет в генерируемом файле курса.
 set -a
+. ./.env.example
 . ./.env
 set +a
 
@@ -58,12 +60,13 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 
 | Команда | Назначение |
 |---|---|
-| `make generate` | заново сгенерировать HTTP-типы и chi-интерфейсы из OpenAPI |
+| `make generate` | обновить HTTP-типы из OpenAPI и моки юзкейсов через `mockgen` |
 | `make migrate` | применить все миграции |
 | `make migrate-down` | откатить все миграции |
 | `make run` | запустить сервис |
 | `make build` | собрать все пакеты |
-| `make test` | выполнить тесты с race detector |
+| `make test` | выполнить unit-тесты с race detector и покрытием |
+| `make test-integration` | применить миграции к указанной тестовой БД и дважды выполнить интеграционные тесты |
 | `make lint` | запустить `golangci-lint` |
 
 `DATABASE_URL` должен присутствовать в окружении для целей миграций. Контракт
@@ -72,7 +75,11 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 
 ## Как сдавать
 
-Работа сдаётся Pull Request из ветки `homework/01` в `main` собственного форка.
+Первая работа сдана отдельным Pull Request из ветки `homework/01`. Вторая
+работа сдаётся отдельным Pull Request из ветки `homework/02` в `main`
+собственного форка. Поскольку первая работа ещё находится на ревью, ветка
+`homework/02` создана от текущей `homework/01`; после принятия первой работы
+основание PR нужно синхронизировать, не закрывая исходный PR.
 Ссылку на PR никуда отправлять не нужно: ревьюер найдёт его внутри форка.
 Подробные правила приведены в `grading.md` репозитория курса.
 
@@ -114,6 +121,37 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 `trip_completed`, `driver_busy` и `internal_error`; SQL, DSN и внутренние детали
 в HTTP-ответ не попадают. Неизвестные JSON-поля, отсутствующие обязательные
 поля и невалидные UUID отклоняются как `400 invalid_request`.
+
+## Архитектура ЛР2
+
+Внешний HTTP-контракт остался прежним: создание, чтение и завершение поездки.
+Новых ручек и миграций в ЛР2 нет. Зависимости направлены внутрь:
+
+```text
+HTTP / OpenAPI → httpapi/{create,get,finish} → usecase/trip/{create,get,finish} → domain
+                         ↑                                      ↑
+                 observability              postgres (через интерфейсы usecase)
+cmd/trip-service → container → конфигурация, пул, репозиторий, юзкейсы, HTTP
+```
+
+`domain` описывает поездку, правила переходов и ошибки без знания HTTP и SQL.
+Каждый юзкейс и каждая HTTP-ручка создания, чтения и завершения живёт в
+отдельном пакете и объявляет узкий интерфейс в своём `contract.go` у
+потребителя. Моки, созданные `mockgen`, и тесты лежат рядом с действиями;
+транзакции и SQL остаются в `storage/postgres`. HTTP преобразует доменные
+ошибки в стабильные RFC 9457 problem-ответы в одном месте. Пакет `container` —
+единственная точка сборки конкретных зависимостей и создания пула; `main`
+отвечает за конфигурацию, сигналы и жизненный цикл сервера. Сгенерированный
+OpenAPI-интерфейс остаётся тонким адаптером для трёх ручек и делегирует
+каждую соответствующему HTTP-действию.
+
+Стандартные переменные `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES` и
+`OTEL_TRACES_SAMPLER` задаются в `.env` окружением курса. Значения по умолчанию
+для локального примера есть в `.env.example`; реальные адреса коллекторов
+нужно брать из `tripgoctl connect`. При недоступном коллекторе сам HTTP-сервис
+не должен прекращать работу. По одному запросу сопоставляются trace ID в
+JSON-логе, серверный/SQL спаны в Jaeger и агрегированные метрики в Grafana.
 
 ## Принятые решения
 
@@ -169,11 +207,17 @@ PostgreSQL блокирует строку. Из двух параллельны
 индекс. У обеих миграций есть рабочий раздел `Down`; goose откатывает их в
 обратном порядке, поэтому внешний ключ не мешает удалению `trips`.
 
+Скриншоты настоящего course-infra окружения, Prometheus-запросы и сверка
+`trace_id` с JSON-логом находятся в [проверке телеметрии](<docs/observability.md>).
+
 ## Тесты
 
 ```bash
 go test ./...
-go test -race ./...
+make test
+# Только с настроенной отдельной тестовой PostgreSQL и DATABASE_URL:
+make test-integration DATABASE_URL='postgres://...'
+# Если сервис запущен: TRIPGO_BASE_URL=http://localhost:8080 make test-integration
 go test -race -count=2 ./...
 go build ./...
 ```

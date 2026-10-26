@@ -69,6 +69,22 @@ linters:
               desc: usecase работает через интерфейсы, а не через драйвер бд
             - pkg: github.com/Masterminds/squirrel
               desc: usecase не строит SQL
+            - pkg: github.com/UnusualNick/template/api
+              desc: usecase не знает про сгенерированный HTTP API
+        httpapi:
+          files:
+            - "**/internal/transport/httpapi/**"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: HTTP-адаптер не знает про драйвер базы
+            - pkg: github.com/Masterminds/squirrel
+              desc: HTTP-адаптер не строит SQL
+            - pkg: github.com/UnusualNick/template/internal/storage
+              desc: HTTP-адаптер не импортирует репозиторий
+            - pkg: github.com/UnusualNick/template/internal/container
+              desc: HTTP-адаптер не импортирует точку сборки
+            - pkg: github.com/UnusualNick/template/internal/usecase
+              desc: HTTP-адаптер делегирует по своему интерфейсу
 
     # Запрещает обращения через идентификатор с подчёркиванием, поэтому пакеты
     # называем без snake_case: internal/adapter/http, а не internal/adapter/http_server.

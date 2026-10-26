@@ -9,9 +9,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const tripBody = `{
@@ -37,9 +40,11 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 		t.Skip("TRIPGO_BASE_URL is not set")
 	}
 
+	// A fresh driver isolates repeated -count runs from previous test data.
+	body := []byte(strings.Replace(tripBody, "8860b315-ec86-42eb-a17c-7c163d721ff5", uuid.NewString(), 1))
 	client := &http.Client{Timeout: 5 * time.Second}
-	assertStatus(t, client, http.MethodGet, baseURL+"/health", nil, http.StatusOK)
-	assertStatus(t, client, http.MethodGet, baseURL+"/ready", nil, http.StatusOK)
+	assertStatus(t, client, http.MethodGet, baseURL+"/health")
+	assertStatus(t, client, http.MethodGet, baseURL+"/ready")
 
 	const attempts = 20
 	start := make(chan struct{})
@@ -51,7 +56,7 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			response, err := request(client, http.MethodPost, baseURL+"/api/v1/trips", []byte(tripBody))
+			response, err := request(client, http.MethodPost, baseURL+"/api/v1/trips", body)
 			if err != nil {
 				errors <- err
 				return
@@ -98,7 +103,7 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 		t.Fatalf("create results: %d created, %d conflicts", created, conflicts)
 	}
 
-	assertStatus(t, client, http.MethodGet, baseURL+"/api/v1/trips/"+tripID, nil, http.StatusOK)
+	assertStatus(t, client, http.MethodGet, baseURL+"/api/v1/trips/"+tripID)
 
 	finishStatuses := make(chan int, 2)
 	finishErrors := make(chan error, 2)
@@ -139,7 +144,21 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 	}
 
 	// A completed trip releases the driver's partial unique-index slot.
-	assertStatus(t, client, http.MethodPost, baseURL+"/api/v1/trips", []byte(tripBody), http.StatusCreated)
+	restarted, err := request(client, http.MethodPost, baseURL+"/api/v1/trips", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedBody := readAndClose(t, restarted)
+	if restarted.StatusCode != http.StatusCreated {
+		t.Fatalf("create after finish: status %d, body %s", restarted.StatusCode, restartedBody)
+	}
+	var nextTrip tripResponse
+	if err := json.Unmarshal(restartedBody, &nextTrip); err != nil {
+		t.Fatal(err)
+	}
+	// There is no DELETE endpoint; finish the second trip to avoid leaving a
+	// live driver reservation in the dedicated test database.
+	assertStatus(t, client, http.MethodPost, baseURL+"/api/v1/trips/"+nextTrip.ID+"/finish")
 }
 
 func assertStatus(
@@ -147,16 +166,14 @@ func assertStatus(
 	client *http.Client,
 	method string,
 	url string,
-	body []byte,
-	want int,
 ) {
 	t.Helper()
-	response, err := request(client, method, url, body)
+	response, err := request(client, method, url, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, url, err)
 	}
 	responseBody := readAndClose(t, response)
-	if response.StatusCode != want {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("%s %s: status %d, body %s", method, url, response.StatusCode, responseBody)
 	}
 }
