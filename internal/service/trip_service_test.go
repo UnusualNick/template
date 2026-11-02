@@ -26,6 +26,7 @@ type fakeTripRepository struct {
 	historyError error
 	finishResult domain.Trip
 	finishError  error
+	finishAt     time.Time
 	getResult    domain.Trip
 	getError     error
 }
@@ -50,7 +51,8 @@ func (r *fakeTripRepository) GetByID(_ context.Context, _ uuid.UUID) (domain.Tri
 	return r.getResult, r.getError
 }
 
-func (r *fakeTripRepository) Finish(_ context.Context, _ uuid.UUID, _ time.Time) (domain.Trip, error) {
+func (r *fakeTripRepository) Finish(_ context.Context, _ uuid.UUID, finishedAt time.Time) (domain.Trip, error) {
+	r.finishAt = finishedAt
 	return r.finishResult, r.finishError
 }
 
@@ -78,6 +80,30 @@ func TestCreateWritesTripAndHistoryInOneTransaction(t *testing.T) {
 	}
 	if trip.Status != domain.TripStatusActive || !trip.StartedAt.Equal(now) {
 		t.Fatalf("created trip = %#v", trip)
+	}
+}
+
+func TestTripTimestampsUseDatabasePrecisionAndUTC(t *testing.T) {
+	clock := time.Date(2026, 11, 1, 18, 12, 22, 768139851, time.FixedZone("MSK", 3*60*60))
+	want := clock.UTC().Truncate(time.Microsecond)
+	repository := &fakeTripRepository{finishResult: domain.Trip{ID: uuid.New()}}
+	service := NewTripService(repository, &fakeTxManager{})
+	service.now = func() time.Time { return clock }
+
+	created, err := service.Create(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if !created.StartedAt.Equal(want) || created.StartedAt.Location() != time.UTC ||
+		repository.insertedTrip == nil || !repository.insertedTrip.StartedAt.Equal(want) {
+		t.Fatalf("created timestamp = %s, want %s", created.StartedAt, want)
+	}
+
+	if _, err := service.Finish(context.Background(), repository.finishResult.ID); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+	if !repository.finishAt.Equal(want) || repository.finishAt.Location() != time.UTC {
+		t.Fatalf("finished timestamp = %s, want %s", repository.finishAt, want)
 	}
 }
 

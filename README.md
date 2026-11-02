@@ -22,7 +22,9 @@ tripgoctl environment start
 tripgoctl connect
 
 # environment start создаёт .env с актуальным DATABASE_URL.
+# Сначала загружаем значения по умолчанию, затем настройки окружения курса.
 set -a
+. ./.env.example
 . ./.env
 set +a
 
@@ -69,12 +71,6 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 `DATABASE_URL` должен присутствовать в окружении для целей миграций. Контракт
 из `contracts/openapi/trip-service.openapi.yaml` не редактируется; генератор
 ограничен пятью операциями первой лабораторной через `oapi-codegen.yaml`.
-
-## Как сдавать
-
-Работа сдаётся Pull Request из ветки `homework/01` в `main` собственного форка.
-Ссылку на PR никуда отправлять не нужно: ревьюер найдёт его внутри форка.
-Подробные правила приведены в `grading.md` репозитория курса.
 
 ## Конфигурация
 
@@ -189,10 +185,30 @@ rollback/panic и переиспользование транзакции при
 
 ## Docker (дополнительная часть)
 
+После `tripgoctl connect` и `make migrate` из быстрого запуска соберите образ:
+
 ```bash
 docker build -t tripgo-trip-service -f deploy/Dockerfile .
-docker run --rm --env-file .env -p 8080:8080 tripgo-trip-service
 ```
+
+На Linux запустите с сетью хоста: адрес `localhost` в `DATABASE_URL` тогда
+указывает на ту же машину, что и при запуске через `make run`.
+
+```bash
+docker run --rm --network host --env-file .env.example --env-file .env tripgo-trip-service
+```
+
+На macOS (Docker Desktop) контейнеру нужен адрес хоста `host.docker.internal`:
+
+```bash
+docker run --rm --env-file .env.example --env-file .env \
+  -e "DATABASE_URL=${DATABASE_URL/localhost/host.docker.internal}" \
+  -p 8080:8080 tripgo-trip-service
+```
+
+Команды выполняются в том же Bash-сеансе, где загружены переменные из быстрого
+запуска. В обоих случаях `.env` перекрывает `.env.example`; на macOS параметр
+`-e` дополнительно заменяет `localhost` в DSN на адрес хоста Docker Desktop.
 
 Образ собирается в два этапа. Финальный слой основан на distroless, не содержит
 исходников и Go toolchain и запускается от non-root пользователя.

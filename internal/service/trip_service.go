@@ -49,7 +49,7 @@ func (s *TripService) Create(ctx context.Context, input domain.CreateTrip) (doma
 		return domain.Trip{}, err
 	}
 
-	now := s.now().UTC()
+	now := s.now().UTC().Truncate(time.Microsecond)
 	trip := domain.Trip{
 		ID:         s.newID(),
 		UserID:     input.UserID,
@@ -90,7 +90,7 @@ func (s *TripService) Finish(ctx context.Context, id uuid.UUID) (domain.Trip, er
 	var trip domain.Trip
 	if err := s.txManager.Do(ctx, func(txCtx context.Context) error {
 		var err error
-		trip, err = s.repository.Finish(txCtx, id, s.now().UTC())
+		trip, err = s.repository.Finish(txCtx, id, s.now().UTC().Truncate(time.Microsecond))
 		if err != nil {
 			return err
 		}

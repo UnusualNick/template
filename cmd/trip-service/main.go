@@ -18,10 +18,15 @@ import (
 )
 
 func main() {
+	slog.SetDefault(newServiceLogger(slog.LevelInfo))
 	if err := run(); err != nil {
-		slog.Error("trip-service stopped", "error", err)
+		slog.Error("trip-service exited", "error", err)
 		os.Exit(1)
 	}
+}
+
+func newServiceLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})).With("service", "trip-service")
 }
 
 func run() error {
@@ -30,7 +35,7 @@ func run() error {
 		return err
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})).With("service", "trip-service")
+	logger := newServiceLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
 	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)

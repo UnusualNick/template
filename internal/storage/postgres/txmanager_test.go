@@ -1,8 +1,12 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -27,8 +31,11 @@ func (*fakePool) Query(context.Context, string, ...any) (pgx.Rows, error) { retu
 func (*fakePool) QueryRow(context.Context, string, ...any) pgx.Row        { return fakeRow{} }
 
 type fakeTx struct {
-	commits   int
-	rollbacks int
+	commits            int
+	rollbacks          int
+	rollbackErr        error
+	rollbackContextErr error
+	rollbackDeadline   bool
 }
 
 func (t *fakeTx) Begin(context.Context) (pgx.Tx, error) { return t, nil }
@@ -37,9 +44,11 @@ func (t *fakeTx) Commit(context.Context) error {
 	return nil
 }
 
-func (t *fakeTx) Rollback(context.Context) error {
+func (t *fakeTx) Rollback(ctx context.Context) error {
 	t.rollbacks++
-	return nil
+	t.rollbackContextErr = ctx.Err()
+	_, t.rollbackDeadline = ctx.Deadline()
+	return t.rollbackErr
 }
 
 func (*fakeTx) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -113,4 +122,92 @@ func TestTxManagerRollsBackAndRepanics(t *testing.T) {
 		}
 	}()
 	_ = manager.Do(context.Background(), func(context.Context) error { panic("boom") })
+}
+
+func TestTxManagerRollsBackAfterRequestCancellation(t *testing.T) {
+	tx := &fakeTx{}
+	manager := NewTxManager(&fakePool{tx: tx})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	want := errors.New("operation failed")
+
+	err := manager.Do(ctx, func(context.Context) error {
+		cancel()
+		return want
+	})
+	if !errors.Is(err, want) || tx.rollbacks != 1 {
+		t.Fatalf("error = %v, rollbacks = %d", err, tx.rollbacks)
+	}
+	if tx.rollbackContextErr != nil || !tx.rollbackDeadline {
+		t.Fatalf("rollback context: error = %v, has deadline = %t", tx.rollbackContextErr, tx.rollbackDeadline)
+	}
+}
+
+func TestTxManagerRollsBackCanceledPanic(t *testing.T) {
+	tx := &fakeTx{}
+	manager := NewTxManager(&fakePool{tx: tx})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	func() {
+		defer func() {
+			if got := recover(); got != "boom" {
+				t.Fatalf("panic = %v", got)
+			}
+		}()
+		_ = manager.Do(ctx, func(context.Context) error {
+			cancel()
+			panic("boom")
+		})
+	}()
+	if tx.rollbacks != 1 || tx.rollbackContextErr != nil || !tx.rollbackDeadline {
+		t.Fatalf("rollback count = %d, context error = %v, has deadline = %t",
+			tx.rollbacks, tx.rollbackContextErr, tx.rollbackDeadline)
+	}
+}
+
+func TestTxManagerPreservesOperationAndRollbackErrors(t *testing.T) {
+	operationErr := errors.New("operation failed")
+	rollbackErr := errors.New("rollback failed")
+	tx := &fakeTx{rollbackErr: rollbackErr}
+	manager := NewTxManager(&fakePool{tx: tx})
+
+	err := manager.Do(context.Background(), func(context.Context) error { return operationErr })
+	if !errors.Is(err, operationErr) || !errors.Is(err, rollbackErr) {
+		t.Fatalf("error does not preserve both causes: %v", err)
+	}
+}
+
+func TestTxManagerIgnoresWrappedClosedTransaction(t *testing.T) {
+	operationErr := errors.New("operation failed")
+	tx := &fakeTx{rollbackErr: fmt.Errorf("already closed: %w", pgx.ErrTxClosed)}
+	manager := NewTxManager(&fakePool{tx: tx})
+
+	err := manager.Do(context.Background(), func(context.Context) error { return operationErr })
+	if err != operationErr {
+		t.Fatalf("error = %v, want original operation error", err)
+	}
+}
+
+func TestTxManagerLogsFailedRollbackOnPanic(t *testing.T) {
+	var output bytes.Buffer
+	rollbackErr := errors.New("rollback unavailable")
+	tx := &fakeTx{rollbackErr: rollbackErr}
+	manager := NewTxManager(&fakePool{tx: tx})
+	manager.logger = slog.New(slog.NewJSONHandler(&output, nil))
+	want := errors.New("panic cause")
+
+	func() {
+		defer func() {
+			if got := recover(); got != want {
+				t.Fatalf("panic = %v, want original %v", got, want)
+			}
+		}()
+		_ = manager.Do(context.Background(), func(context.Context) error { panic(want) })
+	}()
+
+	if tx.rollbacks != 1 || !strings.Contains(output.String(), "rollback transaction after panic failed") ||
+		!strings.Contains(output.String(), rollbackErr.Error()) {
+		t.Fatalf("rollback count = %d, log = %q", tx.rollbacks, output.String())
+	}
 }

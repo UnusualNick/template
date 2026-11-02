@@ -23,8 +23,9 @@ const tripBody = `{
 }`
 
 type tripResponse struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	StartedAt string `json:"started_at"`
 }
 
 type problemResponse struct {
@@ -71,6 +72,7 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 	created := 0
 	conflicts := 0
 	tripID := ""
+	startedAt := ""
 	for response := range results {
 		body := readAndClose(t, response)
 		switch response.StatusCode {
@@ -81,6 +83,7 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 				t.Fatalf("decode created trip: %v", err)
 			}
 			tripID = trip.ID
+			startedAt = trip.StartedAt
 		case http.StatusConflict:
 			conflicts++
 			var problem problemResponse
@@ -98,7 +101,21 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 		t.Fatalf("create results: %d created, %d conflicts", created, conflicts)
 	}
 
-	assertStatus(t, client, http.MethodGet, baseURL+"/api/v1/trips/"+tripID, nil, http.StatusOK)
+	response, err := request(client, http.MethodGet, baseURL+"/api/v1/trips/"+tripID, nil)
+	if err != nil {
+		t.Fatalf("get created trip: %v", err)
+	}
+	body := readAndClose(t, response)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get created trip: status %d, body %s", response.StatusCode, body)
+	}
+	var fetched tripResponse
+	if err := json.Unmarshal(body, &fetched); err != nil {
+		t.Fatalf("decode fetched trip: %v", err)
+	}
+	if startedAt == "" || fetched.StartedAt != startedAt {
+		t.Fatalf("created started_at %q differs from fetched started_at %q", startedAt, fetched.StartedAt)
+	}
 
 	finishStatuses := make(chan int, 2)
 	finishErrors := make(chan error, 2)

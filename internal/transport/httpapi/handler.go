@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -58,16 +60,29 @@ func NewRouter(handler *Handler) http.Handler {
 	return api.HandlerWithOptions(handler, api.ChiServerOptions{
 		BaseRouter: router,
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
-			handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", err.Error())
+			handler.logger.DebugContext(r.Context(), "invalid route parameter", "error", err)
+			var invalidFormat *api.InvalidParamFormatError
+			if errors.As(err, &invalidFormat) && invalidFormat.ParamName == "tripId" {
+				handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "tripId must be a UUID")
+				return
+			}
+			handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "Invalid request parameter")
 		},
 	})
 }
 
 func (h *Handler) CreateTrip(w http.ResponseWriter, r *http.Request, _ api.CreateTripParams) {
+	mediaType, parameters, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" || (parameters["charset"] != "" && !strings.EqualFold(parameters["charset"], "utf-8")) {
+		h.writeProblem(w, r, http.StatusUnsupportedMediaType, "invalid_request", "Invalid request", "Content-Type must be application/json")
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	request, err := decodeCreateTripRequest(r.Body)
 	if err != nil {
-		h.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "Request body is not valid JSON")
+		h.logger.DebugContext(r.Context(), "invalid create trip body", "error", err)
+		h.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", createTripDecodeDetail(err))
 		return
 	}
 
@@ -100,13 +115,32 @@ func decodeCreateTripRequest(reader io.Reader) (api.TripData, error) {
 	}
 
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
-		return api.TripData{}, fmt.Errorf("request body must be a JSON object")
+	fieldsDecoder := json.NewDecoder(bytes.NewReader(body))
+	if err := fieldsDecoder.Decode(&fields); err != nil {
+		return api.TripData{}, err
+	}
+	if err := ensureJSONEOF(fieldsDecoder); err != nil {
+		return api.TripData{}, err
+	}
+	if fields == nil {
+		return api.TripData{}, requestValidationError("request body must be a JSON object")
 	}
 	for _, name := range []string{"user_id", "driver_id", "start_point", "end_point", "price"} {
 		value, ok := fields[name]
 		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return api.TripData{}, fmt.Errorf("required field %q is missing", name)
+			return api.TripData{}, requestValidationError(fmt.Sprintf("required field %q is missing", name))
+		}
+	}
+	for _, point := range []string{"start_point", "end_point"} {
+		var coordinates map[string]json.RawMessage
+		if err := json.Unmarshal(fields[point], &coordinates); err != nil || coordinates == nil {
+			return api.TripData{}, requestValidationError(fmt.Sprintf("field %q must be a JSON object", point))
+		}
+		for _, coordinate := range []string{"latitude", "longitude"} {
+			value, ok := coordinates[coordinate]
+			if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return api.TripData{}, requestValidationError(fmt.Sprintf("required field %q is missing", point+"."+coordinate))
+			}
 		}
 	}
 
@@ -120,6 +154,36 @@ func decodeCreateTripRequest(reader io.Reader) (api.TripData, error) {
 		return api.TripData{}, err
 	}
 	return request, nil
+}
+
+type requestValidationError string
+
+func (e requestValidationError) Error() string { return string(e) }
+
+func createTripDecodeDetail(err error) string {
+	var validationErr requestValidationError
+	if errors.As(err, &validationErr) {
+		return validationErr.Error()
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return "request body exceeds the size limit"
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "request body must be valid JSON"
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		if typeErr.Field == "" {
+			return "request body must be a JSON object"
+		}
+		return "request body contains a field with the wrong type"
+	}
+	if strings.HasPrefix(err.Error(), "json: unknown field ") {
+		return "request body contains an unknown field"
+	}
+	return "request body contains an invalid field value"
 }
 
 func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
@@ -166,7 +230,7 @@ func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
 func ensureJSONEOF(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("request body must contain exactly one JSON object")
+		return requestValidationError("request body must contain exactly one JSON object")
 	}
 	return nil
 }
