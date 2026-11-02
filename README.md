@@ -9,7 +9,7 @@
 - Go 1.24 или новее;
 - `tripgoctl` из репозитория инфраструктуры курса;
 - PostgreSQL и observability-коллектор, поднятые через `tripgoctl`;
-- `golangci-lint` для `make lint`.
+- [golangci-lint v2.15.0](https://github.com/golangci/golangci-lint/releases/tag/v2.15.0) для воспроизводимого `make lint`.
 
 `oapi-codegen` и `goose` закреплены в `go.mod`: команды вызывают их через
 `go tool`, поэтому отдельная установка не нужна.
@@ -138,6 +138,13 @@ get и finish есть отдельные пакеты в HTTP и usecase. Ка�
 объявляет нужный ему интерфейс в `contract.go`; рядом лежат тесты и
 сгенерированные GoMock-моки. SQL и транзакции находятся в `storage/postgres`,
 а HTTP-слой переводит доменные ошибки в RFC 9457.
+
+Пакеты `internal/storage/postgres` и `internal/observability` оставлены отдельно,
+а не собраны в `internal/infra`: первый отвечает за PostgreSQL-репозиторий и
+транзакции, второй — за телеметрию HTTP и pgx. При этом направление зависимостей
+то же: `domain` не знает об инфраструктуре, интерфейсы для БД и транзакций
+объявлены в `usecase`, а `postgres` их реализует. Юзкейсы не импортируют `pgx`
+или OpenTelemetry; `container` подключает реализации и телеметрию.
 
 `container` собирает пул, репозиторий, юзкейсы и HTTP-обработчики. В `main`
 остались запуск сервера, сигналы и остановка. Сгенерированный OpenAPI-адаптер

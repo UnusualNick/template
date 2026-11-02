@@ -1,5 +1,7 @@
 // Package httpapi adapts the generated OpenAPI server to action-specific HTTP
 // handlers. Business rules live in the three independent usecase packages.
+//
+//go:generate sh -c "go run go.uber.org/mock/mockgen -source=handler.go -destination=mocks_test.go -package=httpapi -mock_names=tripService=MockTripService,databasePinger=MockDatabasePinger && sed -n '/^..go:generate /p' handler.go >> mocks_test.go"
 package httpapi
 
 import (
@@ -100,6 +102,12 @@ func (h *Handler) writeProblem(w http.ResponseWriter, r *http.Request, status in
 	h.writeEncoded(w, status, problem)
 }
 
+// WriteInternalError renders a panic response using the same problem format as
+// other internal failures, without exposing the panic to the client.
+func (h *Handler) WriteInternalError(w http.ResponseWriter, r *http.Request) {
+	h.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "Internal Server Error", "An internal error occurred")
+}
+
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	h.writeEncoded(w, status, value)
@@ -117,7 +125,7 @@ func (h *Handler) recoverer(next http.Handler) http.Handler {
 		defer func() {
 			if recover() != nil {
 				h.logger.ErrorContext(r.Context(), "panic recovered", "error.type", "panic")
-				h.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "Internal Server Error", "An internal error occurred")
+				h.WriteInternalError(w, r)
 			}
 		}()
 		next.ServeHTTP(w, r)

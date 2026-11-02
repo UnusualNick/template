@@ -17,6 +17,16 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+const (
+	insertOperation   = "INSERT"
+	selectOperation   = "SELECT"
+	metricDuration    = "db.client.operation.duration"
+	databaseError     = "database_error"
+	privateValue      = "private-value"
+	tripsCollection   = "trips"
+	unknownCollection = "unknown"
+)
+
 func TestPGXTracerRecordsAllQueriesWithSafeLabels(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -32,14 +42,14 @@ func TestPGXTracerRecordsAllQueriesWithSafeLabels(t *testing.T) {
 		collection string
 		errorType  string
 	}{
-		{"INSERT INTO trips (id) VALUES ($1) /* secret-id */", nil, "INSERT", "trips", ""},
-		{"SELECT 1", nil, "SELECT", "unknown", ""},
-		{"begin", nil, "BEGIN", "unknown", ""},
-		{"commit", nil, "COMMIT", "unknown", ""},
-		{"INSERT INTO trip_status_history (reason) VALUES ($1)", errors.New("secret-message"), "INSERT", "trip_status_history", "database_error"},
-		{"SELECT * FROM private_secret_table WHERE id = 'secret-id'", context.DeadlineExceeded, "SELECT", "unknown", "timeout"},
-		{"UPDATE trips SET status = 'secret-value'", context.Canceled, "UPDATE", "trips", "canceled"},
-		{"ALTER TABLE secrets ADD COLUMN hidden TEXT", nil, "OTHER", "unknown", ""},
+		{"INSERT INTO trips (id) VALUES ($1) /* secret-id */", nil, insertOperation, tripsCollection, ""},
+		{"SELECT 1", nil, selectOperation, unknownCollection, ""},
+		{"begin", nil, "BEGIN", unknownCollection, ""},
+		{"commit", nil, "COMMIT", unknownCollection, ""},
+		{"INSERT INTO trip_status_history (reason) VALUES ($1)", errors.New("secret-message"), insertOperation, "trip_status_history", databaseError},
+		{"SELECT * FROM private_secret_table WHERE id = 'secret-id'", context.DeadlineExceeded, selectOperation, unknownCollection, "timeout"},
+		{"UPDATE trips SET status = 'secret-value'", context.Canceled, "UPDATE", tripsCollection, "canceled"},
+		{"ALTER TABLE secrets ADD COLUMN hidden TEXT", nil, "OTHER", unknownCollection, ""},
 	}
 	for _, tc := range cases {
 		ctx := tracer.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: tc.sql, Args: []any{"secret-arg"}})
@@ -54,7 +64,7 @@ func TestPGXTracerRecordsAllQueriesWithSafeLabels(t *testing.T) {
 	count := 0
 	for _, scope := range data.ScopeMetrics {
 		for _, m := range scope.Metrics {
-			if m.Name != "db.client.operation.duration" {
+			if m.Name != metricDuration {
 				continue
 			}
 			if m.Unit != "s" {
@@ -86,7 +96,7 @@ func TestPGXTracerRecordsAllQueriesWithSafeLabels(t *testing.T) {
 						t.Errorf("sensitive metric attribute: %s=%q", key, value)
 					}
 				}
-				count += int(point.Count)
+				count++ // Each histogram point represents one query; Count is checked above.
 			}
 		}
 	}
@@ -115,13 +125,13 @@ func TestPGXTracerEmitsSafeQuerySpans(t *testing.T) {
 		err                                   error
 		status                                codes.Code
 	}{
-		{"SELECT id FROM trips WHERE id = $1", "SELECT", "trips", "", nil, codes.Unset},
-		{"INSERT INTO trip_status_history (trip_id) VALUES ($1)", "INSERT", "trip_status_history", "", nil, codes.Unset},
-		{"UPDATE trips SET status = $1 WHERE id = $2", "UPDATE", "trips", "timeout", context.DeadlineExceeded, codes.Error},
-		{"ROLLBACK /* private-value */", "ROLLBACK", "unknown", "database_error", errors.New("private-value: SQL id 123456"), codes.Error},
+		{"SELECT id FROM trips WHERE id = $1", selectOperation, tripsCollection, "", nil, codes.Unset},
+		{"INSERT INTO trip_status_history (trip_id) VALUES ($1)", insertOperation, "trip_status_history", "", nil, codes.Unset},
+		{"UPDATE trips SET status = $1 WHERE id = $2", "UPDATE", tripsCollection, "timeout", context.DeadlineExceeded, codes.Error},
+		{"ROLLBACK /* private-value */", "ROLLBACK", unknownCollection, databaseError, errors.New("private-value: SQL id 123456"), codes.Error},
 	}
 	for _, tc := range cases {
-		queryCtx := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: tc.sql, Args: []any{"private-value"}})
+		queryCtx := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: tc.sql, Args: []any{privateValue}})
 		tracer.TraceQueryEnd(queryCtx, nil, pgx.TraceQueryEndData{Err: tc.err})
 	}
 	parent.End()
@@ -147,7 +157,7 @@ func TestPGXTracerEmitsSafeQuerySpans(t *testing.T) {
 		attrs := make(map[string]string)
 		for _, attr := range span.Attributes() {
 			attrs[string(attr.Key)] = attr.Value.AsString()
-			if strings.Contains(string(attr.Key), "private") || strings.Contains(attr.Value.Emit(), "private-value") || strings.Contains(attr.Value.Emit(), "123456") || (strings.Contains(tc.sql, " ") && strings.Contains(attr.Value.Emit(), tc.sql)) {
+			if strings.Contains(string(attr.Key), "private") || strings.Contains(attr.Value.Emit(), privateValue) || strings.Contains(attr.Value.Emit(), "123456") || (strings.Contains(tc.sql, " ") && strings.Contains(attr.Value.Emit(), tc.sql)) {
 				t.Errorf("span %d contains query data in attribute %s", i, attr.Key)
 			}
 		}
@@ -174,17 +184,17 @@ func TestPGXTracerOtherSpansDoNotLeakErrors(t *testing.T) {
 	ctx, parent := provider.Tracer("test").Start(context.Background(), "parent")
 	unsafeErr := errors.New("private-value: SELECT id FROM trips WHERE id = 123456")
 	prepareCtx := tracer.TracePrepareStart(ctx, nil, pgx.TracePrepareStartData{
-		Name: "private-value", SQL: "SELECT id FROM trips WHERE id = 123456",
+		Name: privateValue, SQL: "SELECT id FROM trips WHERE id = 123456",
 	})
 	tracer.TracePrepareEnd(prepareCtx, nil, pgx.TracePrepareEndData{Err: unsafeErr})
 	connectCtx := tracer.TraceConnectStart(ctx, pgx.TraceConnectStartData{})
 	tracer.TraceConnectEnd(connectCtx, pgx.TraceConnectEndData{Err: unsafeErr})
 	acquireCtx := tracer.TraceAcquireStart(ctx, nil, pgxpool.TraceAcquireStartData{})
 	tracer.TraceAcquireEnd(acquireCtx, nil, pgxpool.TraceAcquireEndData{Err: unsafeErr})
-	copyCtx := tracer.TraceCopyFromStart(ctx, nil, pgx.TraceCopyFromStartData{TableName: pgx.Identifier{"private-value"}})
+	copyCtx := tracer.TraceCopyFromStart(ctx, nil, pgx.TraceCopyFromStartData{TableName: pgx.Identifier{privateValue}})
 	tracer.TraceCopyFromEnd(copyCtx, nil, pgx.TraceCopyFromEndData{Err: unsafeErr})
 	batchCtx := tracer.TraceBatchStart(ctx, nil, pgx.TraceBatchStartData{})
-	tracer.TraceBatchQuery(batchCtx, nil, pgx.TraceBatchQueryData{SQL: "SELECT * FROM trips WHERE id = 123456", Args: []any{"private-value"}, Err: unsafeErr})
+	tracer.TraceBatchQuery(batchCtx, nil, pgx.TraceBatchQueryData{SQL: "SELECT * FROM trips WHERE id = 123456", Args: []any{privateValue}, Err: unsafeErr})
 	tracer.TraceBatchEnd(batchCtx, nil, pgx.TraceBatchEndData{Err: unsafeErr})
 	parent.End()
 
@@ -199,11 +209,11 @@ func TestPGXTracerOtherSpansDoNotLeakErrors(t *testing.T) {
 		if len(span.Events()) != 0 {
 			t.Errorf("span %s has unsafe events: %+v", span.Name(), span.Events())
 		}
-		if strings.Contains(span.Name(), "private-value") || strings.Contains(span.Name(), "123456") {
+		if strings.Contains(span.Name(), privateValue) || strings.Contains(span.Name(), "123456") {
 			t.Errorf("unsafe span name: %q", span.Name())
 		}
 		for _, attr := range span.Attributes() {
-			if strings.Contains(string(attr.Key), "private-value") || strings.Contains(attr.Value.Emit(), "private-value") || strings.Contains(attr.Value.Emit(), "123456") {
+			if strings.Contains(string(attr.Key), privateValue) || strings.Contains(attr.Value.Emit(), privateValue) || strings.Contains(attr.Value.Emit(), "123456") {
 				t.Errorf("span %s leaks attribute %s=%s", span.Name(), attr.Key, attr.Value.Emit())
 			}
 		}

@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -24,9 +25,10 @@ const unmatchedRoute = "unmatched"
 // the server span's IDs after the inner middleware unwinds on a panic.
 type recoverySpanContextKey struct{}
 
-// Recover catches panics without logging the panic value, which may contain PII.
-// Register it first (outermost) on chi; do not stack with another recoverer.
-func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
+// Recover catches panics and logs their type, redacting arbitrary panic values
+// that can contain secrets or PII. Register it first (outermost) on chi. The
+// optional writer keeps production problem responses consistent with HTTP errors.
+func Recover(logger *slog.Logger, internalErrorWriter ...func(http.ResponseWriter, *http.Request)) func(http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -45,7 +47,7 @@ func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 			})
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					attrs := []any{"http.request.method", r.Method, "http.route", route(r), "stack", string(debug.Stack())}
+					attrs := []any{"http.request.method", r.Method, "http.route", route(r), "panic.type", fmt.Sprintf("%T", recovered), "panic.value", "[redacted]", "stack", string(debug.Stack())}
 					if spanContext.IsValid() {
 						attrs = append(attrs, "trace_id", spanContext.TraceID().String(), "span_id", spanContext.SpanID().String())
 					}
@@ -54,6 +56,10 @@ func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 					// the connection rather than deliver a truncated success body.
 					if written {
 						panic(http.ErrAbortHandler)
+					}
+					if len(internalErrorWriter) > 0 && internalErrorWriter[0] != nil {
+						internalErrorWriter[0](w, r)
+						return
 					}
 					w.Header().Set("Content-Type", "application/problem+json")
 					w.WriteHeader(http.StatusInternalServerError)
@@ -146,10 +152,19 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 // up/down counter. Use it within chi's router.Use chain so route templates are
 // available after dispatch. For the active-request label we match against
 // chi's route tree before dispatch without executing a handler.
-func HTTPMiddleware(_ *slog.Logger) func(http.Handler) http.Handler {
+func HTTPMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	meter := otel.Meter(meterName)
-	duration, _ := meter.Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
-	active, _ := meter.Int64UpDownCounter("http.server.active_requests", metric.WithUnit("{request}"))
+	duration, durationErr := meter.Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	if durationErr != nil {
+		logger.Warn("http duration instrument unavailable", "error", durationErr)
+	}
+	active, activeErr := meter.Int64UpDownCounter("http.server.active_requests", metric.WithUnit("{request}"))
+	if activeErr != nil {
+		logger.Warn("http active-request instrument unavailable", "error", activeErr)
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			initial := []attribute.KeyValue{attribute.String("http.request.method", r.Method), attribute.String("http.route", routeBeforeDispatch(r))}

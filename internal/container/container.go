@@ -36,10 +36,15 @@ type tripActions struct {
 	create *tripcreate.UseCase
 	get    *tripget.UseCase
 	finish *tripfinish.UseCase
+	logger *slog.Logger
 }
 
 func (a tripActions) Create(ctx context.Context, input domain.CreateTrip) (domain.Trip, error) {
-	return a.create.Execute(ctx, input)
+	trip, err := a.create.Execute(ctx, input)
+	if err == nil {
+		logTripEvent(ctx, a.logger, "trip created", trip.ID)
+	}
+	return trip, err
 }
 
 func (a tripActions) Get(ctx context.Context, id uuid.UUID) (domain.Trip, error) {
@@ -47,11 +52,15 @@ func (a tripActions) Get(ctx context.Context, id uuid.UUID) (domain.Trip, error)
 }
 
 func (a tripActions) Finish(ctx context.Context, id uuid.UUID) (domain.Trip, error) {
-	return a.finish.Execute(ctx, id)
+	trip, err := a.finish.Execute(ctx, id)
+	if err == nil {
+		logTripEvent(ctx, a.logger, "trip completed", trip.ID)
+	}
+	return trip, err
 }
 
-func logTripEvent(ctx context.Context, logger *slog.Logger, event string) {
-	attrs := []any{}
+func logTripEvent(ctx context.Context, logger *slog.Logger, event string, tripID uuid.UUID) {
+	attrs := []any{"trip_id", tripID.String()}
 	if span := trace.SpanFromContext(ctx).SpanContext(); span.IsValid() {
 		attrs = append(attrs, "trace_id", span.TraceID().String(), "span_id", span.SpanID().String())
 	}
@@ -65,7 +74,9 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 		if err != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_ = telemetryShutdown(ctx)
+			if shutdownErr := telemetryShutdown(ctx); shutdownErr != nil && logger != nil {
+				logger.Warn("telemetry shutdown failed", "error", shutdownErr)
+			}
 		}
 	}()
 	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
@@ -76,7 +87,7 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 	poolConfig.MinConns = cfg.DatabaseMinConns
 	poolConfig.MaxConnLifetime = cfg.DatabaseMaxConnLifetime
 	poolConfig.ConnConfig.ConnectTimeout = cfg.DatabaseConnectTimeout
-	poolConfig.ConnConfig.Tracer = observability.NewPGXTracer()
+	poolConfig.ConnConfig.Tracer = observability.NewPGXTracer(logger)
 
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.DatabaseConnectTimeout)
 	defer cancelStartup()
@@ -89,24 +100,24 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 		return nil, err
 	}
 
+	counters, err := observability.NewTripCounters()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
 	txManager := postgres.NewTxManager(pool)
 	repository := postgres.NewTripRepository(txManager, cfg.DatabaseQueryTimeout)
 	tripActions := tripActions{
-		create: tripcreate.New(repository, txManager, nil, nil, func(ctx context.Context) {
-			observability.TripCreated(ctx)
-			logTripEvent(ctx, logger, "trip created")
-		}),
-		get: tripget.New(repository),
-		finish: tripfinish.New(repository, txManager, func(ctx context.Context) {
-			observability.TripCompleted(ctx)
-			logTripEvent(ctx, logger, "trip completed")
-		}),
+		create: tripcreate.New(repository, txManager, nil, nil, counters.Created),
+		get:    tripget.New(repository),
+		finish: tripfinish.New(repository, txManager, counters.Completed),
+		logger: logger,
 	}
 	handler := httpapi.NewHandler(tripActions, pool, cfg.DatabaseQueryTimeout, logger)
 	// chi installs these outside the routes, preserving a stable route template.
 	// Outer to inner: Recover → Tracing → Logging → Metrics → routes.
 	routes := httpapi.NewRouter(handler,
-		observability.Recover(logger), observability.Tracing(),
+		observability.Recover(logger, handler.WriteInternalError), observability.Tracing(),
 		observability.Logging(logger), observability.HTTPMiddleware(logger),
 	)
 
@@ -132,7 +143,7 @@ func (a *App) Close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := a.telemetryShutdown(ctx); err != nil && a.logger != nil {
-			a.logger.Warn("telemetry shutdown failed", "error.type", "exporter")
+			a.logger.Warn("telemetry shutdown failed", "error", err)
 		}
 	}
 }

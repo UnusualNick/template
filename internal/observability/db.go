@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -19,8 +20,15 @@ import (
 // as an exception event and a status description. This tracer preserves the
 // query, batch, copy, prepare, connect and pool-acquire spans without exporting
 // SQL, arguments, connection details, statement names or error messages.
-func NewPGXTracer() pgx.QueryTracer {
-	histogram, _ := otel.Meter(meterName).Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+func NewPGXTracer(loggers ...*slog.Logger) pgx.QueryTracer {
+	logger := slog.Default()
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	histogram, err := otel.Meter(meterName).Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	if err != nil {
+		logger.Warn("db duration instrument unavailable", "error", err)
+	}
 	return &dbTracer{histogram: histogram, tracer: otel.Tracer(meterName)}
 }
 
@@ -167,7 +175,7 @@ func dbQueryLabels(sql string) (operation, collection string) {
 	operation, collection = "OTHER", "unknown"
 	fields := strings.Fields(sql)
 	if len(fields) == 0 {
-		return
+		return operation, collection
 	}
 	first := strings.ToUpper(fields[0])
 	table := ""
@@ -204,5 +212,5 @@ func dbQueryLabels(sql string) (operation, collection string) {
 	case "trip_status_history", "public.trip_status_history":
 		collection = "trip_status_history"
 	}
-	return
+	return operation, collection
 }

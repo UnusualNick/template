@@ -1,12 +1,13 @@
 // Package observability provides optional OTLP telemetry and HTTP instrumentation.
 // Integrate with a chi router via router.Use(Recover(logger), Tracing(),
-// Logging(logger), HTTPMiddleware(logger)). Register trip counters at successful
-// create/finish boundaries with TripCreated and TripCompleted. No endpoint is added.
+// Logging(logger), HTTPMiddleware(logger)). Record trip counters at successful
+// create/finish boundaries. No endpoint is added.
 package observability
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"runtime/debug"
@@ -28,6 +29,14 @@ import (
 
 const meterName = "github.com/UnusualNick/template/internal/observability"
 
+// ServiceName is the service name shared by resource attributes and logs.
+func ServiceName() string {
+	if name := os.Getenv("OTEL_SERVICE_NAME"); name != "" {
+		return name
+	}
+	return "trip-service"
+}
+
 // Init installs OTLP HTTP/protobuf (default) or gRPC tracing and metrics.
 // Exporting happens in the background; an unavailable collector cannot prevent
 // startup. OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG control sampling.
@@ -37,9 +46,12 @@ func Init(ctx context.Context, logger *slog.Logger) func(context.Context) error 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		logger.Warn("telemetry error", "error", err)
+	}))
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
-			attribute.String("service.name", "trip-service"),
+			attribute.String("service.name", ServiceName()),
 			attribute.String("service.version", serviceVersion()),
 			attribute.String("service.namespace", "tripgo"),
 			attribute.String("deployment.environment", "local"),
@@ -151,32 +163,31 @@ func traceSampler(logger *slog.Logger) sdktrace.Sampler {
 	}
 }
 
-// TripCreated records one successful creation. Call only after a committed transaction.
-func TripCreated(ctx context.Context) { recordTrip(ctx, "tripgo.trips.created") }
-
-// TripCompleted records one successful completion. Call only after a committed transaction.
-func TripCompleted(ctx context.Context) { recordTrip(ctx, "tripgo.trips.completed") }
-
-func recordTrip(ctx context.Context, name string) {
-	counter, err := otel.Meter(meterName).Int64Counter(name)
-	if err == nil {
-		counter.Add(ctx, 1)
-	}
+// TripCounters owns instruments created once at startup, without per-trip labels.
+type TripCounters struct {
+	created   metric.Int64Counter
+	completed metric.Int64Counter
 }
 
-// RecordDBOperation records repository operation latency without query text or identifiers.
-// operation and collection must be static low-cardinality names, not SQL or user input.
-func RecordDBOperation(ctx context.Context, operation, collection string, elapsed time.Duration, err error) {
-	histogram, createErr := otel.Meter(meterName).Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
-	if createErr != nil {
-		return
-	}
-	attrs := []attribute.KeyValue{attribute.String("db.operation.name", operation), attribute.String("db.collection.name", collection)}
+// NewTripCounters reports registration errors rather than silently losing metrics.
+func NewTripCounters() (TripCounters, error) {
+	meter := otel.Meter(meterName)
+	created, err := meter.Int64Counter("tripgo.trips.created")
 	if err != nil {
-		attrs = append(attrs, attribute.String("error.type", dbErrorType(err)))
+		return TripCounters{}, fmt.Errorf("create trips-created counter: %w", err)
 	}
-	histogram.Record(ctx, elapsed.Seconds(), metric.WithAttributes(attrs...))
+	completed, err := meter.Int64Counter("tripgo.trips.completed")
+	if err != nil {
+		return TripCounters{}, fmt.Errorf("create trips-completed counter: %w", err)
+	}
+	return TripCounters{created: created, completed: completed}, nil
 }
+
+// Created records one successful creation. Call only after a committed transaction.
+func (c TripCounters) Created(ctx context.Context) { c.created.Add(ctx, 1) }
+
+// Completed records one successful completion. Call only after a committed transaction.
+func (c TripCounters) Completed(ctx context.Context) { c.completed.Add(ctx, 1) }
 
 func dbErrorType(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {

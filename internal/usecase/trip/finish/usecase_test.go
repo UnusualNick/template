@@ -12,7 +12,11 @@ import (
 	"github.com/UnusualNick/template/internal/domain"
 )
 
-const unknownStatus = "unknown"
+const (
+	unknownStatus        = "unknown"
+	notFoundFailureStep  = "not found"
+	completedFailureStep = "completed"
+)
 
 func TestExecute(t *testing.T) {
 	id := uuid.MustParse("1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111")
@@ -29,9 +33,9 @@ func TestExecute(t *testing.T) {
 	}{
 		{name: "committed"},
 		{name: "begin failure", failAt: "begin", wantError: failure},
-		{name: "not found", failAt: "not found", wantError: domain.ErrTripNotFound},
+		{name: notFoundFailureStep, failAt: notFoundFailureStep, wantError: domain.ErrTripNotFound},
 		{name: "get failure", failAt: "get", wantError: failure},
-		{name: "already completed", failAt: "completed", wantError: domain.ErrTripCompleted},
+		{name: "already completed", failAt: completedFailureStep, wantError: domain.ErrTripCompleted},
 		{name: "unknown status", failAt: unknownStatus, wantError: domain.ErrInvalidInput},
 		{name: "concurrent finish", failAt: "race", wantError: domain.ErrTripCompleted},
 		{name: "finish failure", failAt: "finish", wantError: failure},
@@ -71,11 +75,11 @@ func TestExecute(t *testing.T) {
 				})
 				current, getError := active, error(nil)
 				switch tc.failAt {
-				case "not found":
+				case notFoundFailureStep:
 					getError = domain.ErrTripNotFound
 				case "get":
 					getError = failure
-				case "completed":
+				case completedFailureStep:
 					current = completed
 				case unknownStatus:
 					current.Status = unknownStatus

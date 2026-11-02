@@ -133,3 +133,53 @@ func TestRepositoryCreateAndFinishWithHistory(t *testing.T) {
 		t.Fatalf("repeated finish: got %v, want ErrTripCompleted", err)
 	}
 }
+
+func TestRepositoryDriverBusyConstraint(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL is required for integration tests")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := NewTripRepository(NewTxManager(pool), 5*time.Second)
+	first := domain.Trip{
+		ID: uuid.New(), UserID: uuid.New(), DriverID: uuid.New(),
+		StartPoint: domain.Coordinates{Latitude: 10, Longitude: 20},
+		EndPoint:   domain.Coordinates{Latitude: 11, Longitude: 21},
+		Price:      100, Status: domain.TripStatusActive, StartedAt: time.Now().UTC(),
+	}
+	second := first
+	second.ID = uuid.New()
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		for _, id := range []uuid.UUID{first.ID, second.ID} {
+			if _, cleanupErr := pool.Exec(cleanupCtx, "DELETE FROM trips WHERE id = $1", id); cleanupErr != nil {
+				t.Errorf("clean up test row: %v", cleanupErr)
+			}
+		}
+	}()
+
+	if err := repo.Insert(ctx, first); err != nil {
+		t.Fatalf("first trip insert: %v", err)
+	}
+	if err := repo.Insert(ctx, second); !errors.Is(err, domain.ErrDriverBusy) {
+		t.Fatalf("second trip insert = %v, want ErrDriverBusy", err)
+	}
+	var active int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM trips WHERE driver_id = $1 AND status = 'active'", first.DriverID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active trips for driver = %d, want 1", active)
+	}
+}

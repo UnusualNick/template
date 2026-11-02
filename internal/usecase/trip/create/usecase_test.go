@@ -15,6 +15,8 @@ import (
 
 type transactionKey struct{}
 
+const insertFailureStep = "insert"
+
 func TestExecute(t *testing.T) {
 	id := uuid.MustParse("fa73b327-7c76-4a44-9c4d-39eb684ca5a2")
 	userID := uuid.MustParse("5e17cf63-0784-43bc-9094-bb11d0d6ad0a")
@@ -45,7 +47,7 @@ func TestExecute(t *testing.T) {
 	}{
 		{name: "success", input: input, wantCreated: true},
 		{name: "invalid input", input: domain.CreateTrip{DriverID: driverID}, wantErr: domain.ErrInvalidInput, wantField: "user_id"},
-		{name: "insert failure", input: input, failure: "insert", wantErr: insertErr},
+		{name: "insert failure", input: input, failure: insertFailureStep, wantErr: insertErr},
 		{name: "history failure", input: input, failure: "history", wantErr: historyErr},
 		{name: "commit failure", input: input, failure: "commit", wantErr: commitErr},
 	}
@@ -88,12 +90,12 @@ func TestExecute(t *testing.T) {
 				})
 				// Expectations within Do check that both writes use the transaction context.
 				repository.EXPECT().Insert(txCtx, want).Return(func() error {
-					if tt.failure == "insert" {
+					if tt.failure == insertFailureStep {
 						return insertErr
 					}
 					return nil
 				}())
-				if tt.failure != "insert" {
+				if tt.failure != insertFailureStep {
 					repository.EXPECT().InsertStatusHistory(txCtx, id, nil, domain.TripStatusActive, "trip created").Return(func() error {
 						if tt.failure == "history" {
 							return historyErr

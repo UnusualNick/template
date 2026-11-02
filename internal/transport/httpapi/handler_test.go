@@ -17,40 +17,28 @@ import (
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.uber.org/mock/gomock"
 
 	"github.com/UnusualNick/template/api"
 	"github.com/UnusualNick/template/internal/domain"
 	"github.com/UnusualNick/template/internal/observability"
 )
 
-type fakeService struct {
-	created     domain.Trip
-	got         domain.Trip
-	finished    domain.Trip
-	err         error
-	createCalls int
+func testService(t *testing.T) *MockTripService {
+	t.Helper()
+	return NewMockTripService(gomock.NewController(t))
 }
 
-func (s *fakeService) Create(_ context.Context, _ domain.CreateTrip) (domain.Trip, error) {
-	s.createCalls++
-	return s.created, s.err
+func testPinger(t *testing.T) *MockDatabasePinger {
+	t.Helper()
+	return NewMockDatabasePinger(gomock.NewController(t))
 }
-
-func (s *fakeService) Get(_ context.Context, _ uuid.UUID) (domain.Trip, error) {
-	return s.got, s.err
-}
-
-func (s *fakeService) Finish(_ context.Context, _ uuid.UUID) (domain.Trip, error) {
-	return s.finished, s.err
-}
-
-type fakePinger struct{ err error }
-
-func (p fakePinger) Ping(context.Context) error { return p.err }
 
 func TestCreateTrip(t *testing.T) {
 	trip := sampleTrip()
-	router := testRouter(&fakeService{created: trip}, fakePinger{})
+	service := testService(t)
+	service.EXPECT().Create(gomock.Any(), gomock.Any()).Return(trip, nil)
+	router := testRouter(service, testPinger(t))
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(`{
 		"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c",
 		"driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5",
@@ -98,25 +86,25 @@ func TestCreateTripBodyValidation(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			service := &fakeService{created: sampleTrip()}
-			recorder := httptest.NewRecorder()
-			testRouter(service, fakePinger{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(test.body)))
+			service := testService(t)
 			if test.status == http.StatusCreated {
-				if recorder.Code != test.status || service.createCalls != 1 {
-					t.Fatalf("status = %d, create calls = %d, body = %s", recorder.Code, service.createCalls, recorder.Body.String())
+				service.EXPECT().Create(gomock.Any(), gomock.Any()).Return(sampleTrip(), nil).Times(1)
+			}
+			recorder := httptest.NewRecorder()
+			testRouter(service, testPinger(t)).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(test.body)))
+			if test.status == http.StatusCreated {
+				if recorder.Code != test.status {
+					t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 				}
 				return
 			}
 			assertProblem(t, recorder, test.status, "invalid_request")
-			if service.createCalls != 0 {
-				t.Fatalf("invalid body called service %d times", service.createCalls)
-			}
 		})
 	}
 }
 
 func TestGeneratedRouterRejectsInvalidTripID(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{})
+	router := testRouter(testService(t), testPinger(t))
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/trips/not-a-uuid", nil))
 	assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
@@ -134,7 +122,7 @@ func TestDomainErrorsUseProblemJSON(t *testing.T) {
 		{"trip not found", fmt.Errorf("wrapped: %w", domain.ErrTripNotFound), http.StatusNotFound, "trip_not_found", "Trip was not found"},
 		{"trip completed", fmt.Errorf("wrapped: %w", domain.ErrTripCompleted), http.StatusConflict, "trip_completed", "Operation is not allowed for a completed trip"},
 		{"invalid input", fmt.Errorf("secret data: %w", domain.ErrInvalidInput), http.StatusBadRequest, "invalid_request", "Invalid trip input"},
-		{"field error", fmt.Errorf("secret data: %w", &domain.FieldError{Field: "price", Reason: "must not be negative"}), http.StatusBadRequest, "invalid_request", "Invalid trip input"},
+		{"field error", fmt.Errorf("secret data: %w", &domain.FieldError{Field: "price", Reason: "must not be negative"}), http.StatusBadRequest, "invalid_request", "price: must not be negative"},
 		{"unknown failure", errors.New("secret database credentials"), http.StatusInternalServerError, "internal_error", "An internal error occurred"},
 	}
 	paths := []struct {
@@ -148,7 +136,16 @@ func TestDomainErrorsUseProblemJSON(t *testing.T) {
 	for _, test := range tests {
 		for _, endpoint := range paths {
 			t.Run(test.name+"/"+endpoint.name, func(t *testing.T) {
-				router := testRouter(&fakeService{err: test.err}, fakePinger{})
+				service := testService(t)
+				switch endpoint.name {
+				case "create":
+					service.EXPECT().Create(gomock.Any(), gomock.Any()).Return(domain.Trip{}, test.err)
+				case "get":
+					service.EXPECT().Get(gomock.Any(), gomock.Any()).Return(domain.Trip{}, test.err)
+				case "finish":
+					service.EXPECT().Finish(gomock.Any(), gomock.Any()).Return(domain.Trip{}, test.err)
+				}
+				router := testRouter(service, testPinger(t))
 				recorder := httptest.NewRecorder()
 				router.ServeHTTP(recorder, httptest.NewRequest(endpoint.method, endpoint.path, strings.NewReader(body)))
 				problem := assertProblem(t, recorder, test.status, test.code)
@@ -166,8 +163,22 @@ func TestDomainErrorsUseProblemJSON(t *testing.T) {
 	}
 }
 
+func TestInternalErrorWriterUsesSameProblemFormat(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := NewHandler(testService(t), testPinger(t), time.Second, logger)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/trips/example", nil)
+	recorder := httptest.NewRecorder()
+	handler.WriteInternalError(recorder, request)
+	problem := assertProblem(t, recorder, http.StatusInternalServerError, "internal_error")
+	if problem.Type != "https://tripgo.example/problems/internal-error" || problem.Title != "Internal Server Error" {
+		t.Fatalf("unexpected internal problem: %+v", problem)
+	}
+}
+
 func TestHealthAndReady(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{err: errors.New("down")})
+	pinger := testPinger(t)
+	pinger.EXPECT().Ping(gomock.Any()).Return(errors.New("down"))
+	router := testRouter(testService(t), pinger)
 
 	health := httptest.NewRecorder()
 	router.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -196,7 +207,9 @@ func TestGeneratedRoutesGiveActiveMetricTemplate(t *testing.T) {
 	otel.SetMeterProvider(provider)
 	t.Cleanup(func() { otel.SetMeterProvider(previous); _ = provider.Shutdown(context.Background()) })
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	router := NewRouter(NewHandler(&fakeService{got: sampleTrip()}, fakePinger{}, time.Second, logger), observability.HTTPMiddleware(logger))
+	service := testService(t)
+	service.EXPECT().Get(gomock.Any(), gomock.Any()).Return(sampleTrip(), nil)
+	router := NewRouter(NewHandler(service, testPinger(t), time.Second, logger), observability.HTTPMiddleware(logger))
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/trips/1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111", nil))
 	if recorder.Code != http.StatusOK {
@@ -223,7 +236,7 @@ func TestGeneratedRoutesGiveActiveMetricTemplate(t *testing.T) {
 	t.Fatal("no balanced active-request metric with generated route template")
 }
 
-func testRouter(service *fakeService, pinger fakePinger) http.Handler {
+func testRouter(service tripService, pinger databasePinger) http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewRouter(NewHandler(service, pinger, time.Second, logger))
 }

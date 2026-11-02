@@ -4,7 +4,10 @@ package shared
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
+
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/UnusualNick/template/api"
 	"github.com/UnusualNick/template/internal/domain"
@@ -27,6 +30,13 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, status int, problem ap
 
 func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	status, problem := domainerror.Problem(err)
+	if status == http.StatusInternalServerError {
+		attrs := []any{"error", err, "http.request.method", r.Method}
+		if span := trace.SpanFromContext(r.Context()).SpanContext(); span.IsValid() {
+			attrs = append(attrs, "trace_id", span.TraceID().String())
+		}
+		slog.Default().ErrorContext(r.Context(), "unhandled service error", attrs...)
+	}
 	WriteProblem(w, r, status, problem)
 }
 

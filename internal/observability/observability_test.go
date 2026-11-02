@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel"
@@ -22,6 +20,17 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 )
+
+func TestServiceNameMatchesOTELEnvironment(t *testing.T) {
+	t.Setenv("OTEL_SERVICE_NAME", "journey-api")
+	if got := ServiceName(); got != "journey-api" {
+		t.Fatalf("OTEL_SERVICE_NAME = %q", got)
+	}
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	if got := ServiceName(); got != "trip-service" {
+		t.Fatalf("default service name = %q", got)
+	}
+}
 
 func TestHTTPMetricsUseRouteTemplateAndSeconds(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
@@ -207,18 +216,51 @@ func TestRecoverProblemAndSingleRequestLog(t *testing.T) {
 		switch event["msg"] {
 		case "http request":
 			requestLogs++
-			if event["level"] != "ERROR" || event["http.response.status_code"] != float64(500) || event["http.route"] != "/private/{id}" || event["duration_ms"] == nil || event["trace_id"] == nil || event["span_id"] == nil {
-				t.Errorf("request log: %v", event)
-			}
+			assertRecoveryRequestLog(t, event)
 		case "request panic":
 			panicLogs++
-			if event["stack"] == nil || event["trace_id"] != span.SpanContext().TraceID().String() || event["span_id"] != span.SpanContext().SpanID().String() || event["http.route"] != "/private/{id}" {
-				t.Errorf("uncorrelated panic log: %v", event)
-			}
+			assertRecoveryPanicLog(t, event, span.SpanContext())
 		}
 	}
 	if requestLogs != 1 || panicLogs != 1 {
 		t.Errorf("request logs: %d, panic logs: %d", requestLogs, panicLogs)
+	}
+}
+
+func assertRecoveryRequestLog(t *testing.T, event map[string]any) {
+	t.Helper()
+	if event["level"] != "ERROR" || event["http.response.status_code"] != float64(500) ||
+		event["http.route"] != "/private/{id}" || event["duration_ms"] == nil ||
+		event["trace_id"] == nil || event["span_id"] == nil {
+		t.Errorf("request log: %v", event)
+	}
+}
+
+func assertRecoveryPanicLog(t *testing.T, event map[string]any, span trace.SpanContext) {
+	t.Helper()
+	if event["stack"] == nil || event["panic.type"] != "string" || event["panic.value"] != "[redacted]" ||
+		event["trace_id"] != span.TraceID().String() || event["span_id"] != span.SpanID().String() ||
+		event["http.route"] != "/private/{id}" {
+		t.Errorf("uncorrelated panic log: %v", event)
+	}
+}
+
+func TestRecoverUsesProvidedProblemWriter(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	called := 0
+	router := chi.NewRouter()
+	router.Use(Recover(logger, func(w http.ResponseWriter, _ *http.Request) {
+		called++
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"type":"https://tripgo.example/problems/internal-error","code":"internal_error"}`))
+	}))
+	router.Get("/panic", func(http.ResponseWriter, *http.Request) { panic("hidden") })
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	if called != 1 || recorder.Code != http.StatusInternalServerError ||
+		!strings.Contains(recorder.Body.String(), "https://tripgo.example/problems/internal-error") {
+		t.Fatalf("problem writer calls = %d, response = %d %q", called, recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -239,16 +281,19 @@ func TestRecoverAbortsCommittedPartialResponse(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/partial", nil))
 }
 
-func TestDBMetricsAndTripCounters(t *testing.T) {
+func TestTripCounters(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	previous := otel.GetMeterProvider()
 	otel.SetMeterProvider(provider)
 	t.Cleanup(func() { otel.SetMeterProvider(previous); _ = provider.Shutdown(context.Background()) })
+	counters, err := NewTripCounters()
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	TripCreated(ctx)
-	TripCompleted(ctx)
-	RecordDBOperation(ctx, "INSERT", "trips", 250*time.Millisecond, errors.New("do not export secret"))
+	counters.Created(ctx)
+	counters.Completed(ctx)
 	var data metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &data); err != nil {
 		t.Fatal(err)
@@ -257,29 +302,13 @@ func TestDBMetricsAndTripCounters(t *testing.T) {
 	for _, scope := range data.ScopeMetrics {
 		for _, m := range scope.Metrics {
 			seen[m.Name] = true
-			switch m.Name {
-			case "db.client.operation.duration":
-				if m.Unit != "s" {
-					t.Errorf("db unit: %s", m.Unit)
-				}
-				points := m.Data.(metricdata.Histogram[float64]).DataPoints
-				if len(points) != 1 || points[0].Count != 1 || points[0].Sum != .25 {
-					t.Errorf("db duration: %+v", points)
-				}
-				for _, attr := range points[0].Attributes.ToSlice() {
-					if attr.Key == "error.type" && attr.Value.AsString() != "database_error" {
-						t.Errorf("error attr: %v", attr)
-					}
-				}
-			case "tripgo.trips.created", "tripgo.trips.completed":
-				points := m.Data.(metricdata.Sum[int64]).DataPoints
-				if len(points) != 1 || points[0].Value != 1 || points[0].Attributes.Len() != 0 {
-					t.Errorf("trip count: %+v", points)
-				}
+			points := m.Data.(metricdata.Sum[int64]).DataPoints
+			if len(points) != 1 || points[0].Value != 1 || points[0].Attributes.Len() != 0 {
+				t.Errorf("trip count: %+v", points)
 			}
 		}
 	}
-	for _, name := range []string{"db.client.operation.duration", "tripgo.trips.created", "tripgo.trips.completed"} {
+	for _, name := range []string{"tripgo.trips.created", "tripgo.trips.completed"} {
 		if !seen[name] {
 			t.Errorf("missing %s", name)
 		}

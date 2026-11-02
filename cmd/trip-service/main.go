@@ -11,13 +11,19 @@ import (
 
 	"github.com/UnusualNick/template/internal/config"
 	"github.com/UnusualNick/template/internal/container"
+	"github.com/UnusualNick/template/internal/observability"
 )
 
 func main() {
+	slog.SetDefault(newServiceLogger(slog.LevelInfo))
 	if err := run(); err != nil {
-		slog.Error("trip-service stopped", "error", err)
+		slog.Error("trip-service exited", "error", err)
 		os.Exit(1)
 	}
+}
+
+func newServiceLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})).With("service", observability.ServiceName())
 }
 
 func run() error {
@@ -25,7 +31,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})).With("service", "trip-service")
+	logger := newServiceLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
 
 	app, err := container.New(cfg, logger)
 	if err != nil {

@@ -11,7 +11,7 @@ import (
 )
 
 // Problem translates a service error into an HTTP status and a public problem.
-// Error strings are deliberately not included: wrapped errors may contain private data.
+// Wrapped error strings are never included: they may contain private data.
 func Problem(err error) (int, api.Problem) {
 	switch {
 	case errors.Is(err, domain.ErrDriverBusy):
@@ -21,10 +21,30 @@ func Problem(err error) (int, api.Problem) {
 	case errors.Is(err, domain.ErrTripCompleted):
 		return NewProblem(http.StatusConflict, "trip_completed", "Trip completed", "Operation is not allowed for a completed trip")
 	case errors.Is(err, domain.ErrInvalidInput):
-		return NewProblem(http.StatusBadRequest, "invalid_request", "Invalid request", "Invalid trip input")
+		detail := "Invalid trip input"
+		var fieldErr *domain.FieldError
+		if errors.As(err, &fieldErr) && fieldErr != nil {
+			if reason, known := safeFieldReasons[fieldErr.Field]; known && reason == fieldErr.Reason {
+				detail = fieldErr.Field + ": " + fieldErr.Reason
+			}
+		}
+		return NewProblem(http.StatusBadRequest, "invalid_request", "Invalid request", detail)
 	default:
 		return NewProblem(http.StatusInternalServerError, "internal_error", "Internal Server Error", "An internal error occurred")
 	}
+}
+
+// Only validation messages emitted by domain rules may be exposed. A FieldError
+// from another source must not turn arbitrary field names or reasons into output.
+var safeFieldReasons = map[string]string{
+	"user_id":               "must be a non-zero UUID",
+	"driver_id":             "must be a non-zero UUID",
+	"start_point.latitude":  "must be between -90 and 90",
+	"start_point.longitude": "must be between -180 and 180",
+	"end_point.latitude":    "must be between -90 and 90",
+	"end_point.longitude":   "must be between -180 and 180",
+	"price":                 "must not be negative",
+	"status":                "must be active",
 }
 
 // NewProblem builds a problem with a public, caller-supplied detail.
