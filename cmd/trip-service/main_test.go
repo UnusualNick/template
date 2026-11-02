@@ -14,7 +14,7 @@ func TestStartupFailureHasStructuredServiceLog(t *testing.T) {
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestStartupFailureHasStructuredServiceLog$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStartupFailureHasStructuredServiceLog$") //nolint:gosec // Execute this test binary to verify the main process log.
 	cmd.Env = append(os.Environ(), "TRIPGO_STARTUP_TEST=1", "HTTP_ADDR=")
 	output, err := cmd.CombinedOutput()
 	if err == nil {

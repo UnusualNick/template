@@ -9,12 +9,15 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-const tripBody = `{
+const tripBodyTemplate = `{
   "user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c",
   "driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5",
   "start_point":{"latitude":59.9398,"longitude":30.3146},
@@ -39,6 +42,7 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
+	tripBody := strings.Replace(tripBodyTemplate, "8860b315-ec86-42eb-a17c-7c163d721ff5", uuid.NewString(), 1)
 	assertStatus(t, client, http.MethodGet, baseURL+"/health", nil, http.StatusOK)
 	assertStatus(t, client, http.MethodGet, baseURL+"/ready", nil, http.StatusOK)
 
@@ -156,7 +160,19 @@ func TestTripLifecycleAndConcurrency(t *testing.T) {
 	}
 
 	// A completed trip releases the driver's partial unique-index slot.
-	assertStatus(t, client, http.MethodPost, baseURL+"/api/v1/trips", []byte(tripBody), http.StatusCreated)
+	second, err := request(client, http.MethodPost, baseURL+"/api/v1/trips", []byte(tripBody))
+	if err != nil {
+		t.Fatalf("create second trip: %v", err)
+	}
+	secondBody := readAndClose(t, second)
+	if second.StatusCode != http.StatusCreated {
+		t.Fatalf("create second trip: status %d, body %s", second.StatusCode, secondBody)
+	}
+	var secondTrip tripResponse
+	if err := json.Unmarshal(secondBody, &secondTrip); err != nil {
+		t.Fatalf("decode second trip: %v", err)
+	}
+	assertStatus(t, client, http.MethodPost, baseURL+"/api/v1/trips/"+secondTrip.ID+"/finish", nil, http.StatusOK)
 }
 
 func assertStatus(
