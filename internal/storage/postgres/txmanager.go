@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -20,10 +23,13 @@ type beginner interface {
 
 type txContextKey struct{}
 
+const rollbackTimeout = 5 * time.Second
+
 type TxManager struct {
 	pool      DBTX
 	beginner  beginner
 	txOptions pgx.TxOptions
+	logger    *slog.Logger
 }
 
 func NewTxManager(pool interface {
@@ -34,6 +40,7 @@ func NewTxManager(pool interface {
 	return &TxManager{
 		pool:     pool,
 		beginner: pool,
+		logger:   slog.Default(),
 		txOptions: pgx.TxOptions{
 			IsoLevel: pgx.ReadCommitted,
 		},
@@ -53,14 +60,16 @@ func (m *TxManager) Do(ctx context.Context, fn func(context.Context) error) (err
 	txCtx := context.WithValue(ctx, txContextKey{}, tx)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			_ = tx.Rollback(ctx)
+			if rollbackErr := rollbackTransaction(ctx, tx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+				m.logger.Warn("rollback transaction after panic failed", "error", rollbackErr)
+			}
 			panic(recovered)
 		}
 	}()
 
 	if err := fn(txCtx); err != nil {
-		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil && rollbackErr != pgx.ErrTxClosed {
-			return fmt.Errorf("rollback transaction after %w: %v", err, rollbackErr)
+		if rollbackErr := rollbackTransaction(ctx, tx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			return errors.Join(err, fmt.Errorf("rollback transaction: %w", rollbackErr))
 		}
 		return err
 	}
@@ -69,6 +78,12 @@ func (m *TxManager) Do(ctx context.Context, fn func(context.Context) error) (err
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+func rollbackTransaction(ctx context.Context, tx pgx.Tx) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+	return tx.Rollback(rollbackCtx)
 }
 
 func (m *TxManager) Executor(ctx context.Context) DBTX {

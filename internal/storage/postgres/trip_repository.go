@@ -166,5 +166,14 @@ func scanTrip(row rowScanner) (domain.Trip, error) {
 	); err != nil {
 		return domain.Trip{}, err
 	}
+	trip.StartedAt = trip.StartedAt.UTC().Truncate(time.Microsecond)
+	if trip.FinishedAt != nil {
+		finishedAt := trip.FinishedAt.UTC().Truncate(time.Microsecond)
+		trip.FinishedAt = &finishedAt
+	}
+	if trip.LastPositionAt != nil {
+		lastPositionAt := trip.LastPositionAt.UTC().Truncate(time.Microsecond)
+		trip.LastPositionAt = &lastPositionAt
+	}
 	return trip, nil
 }

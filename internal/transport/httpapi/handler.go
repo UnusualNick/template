@@ -7,6 +7,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -62,8 +63,14 @@ func NewRouter(handler *Handler, middlewares ...func(http.Handler) http.Handler)
 	}
 	return api.HandlerWithOptions(handler, api.ChiServerOptions{
 		BaseRouter: router,
-		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, _ error) {
-			handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "Invalid path parameter")
+		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+			handler.logger.DebugContext(r.Context(), "invalid route parameter", "error", err)
+			var invalidFormat *api.InvalidParamFormatError
+			if errors.As(err, &invalidFormat) && invalidFormat.ParamName == "tripId" {
+				handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "tripId must be a UUID")
+				return
+			}
+			handler.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "Invalid request parameter")
 		},
 	})
 }

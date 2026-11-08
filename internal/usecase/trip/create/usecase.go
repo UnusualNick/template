@@ -45,7 +45,7 @@ func (u *UseCase) Execute(ctx context.Context, input domain.CreateTrip) (domain.
 		EndPoint:   input.EndPoint,
 		Price:      input.Price,
 		Status:     domain.TripStatusActive,
-		StartedAt:  u.now().UTC(),
+		StartedAt:  u.now().UTC().Truncate(time.Microsecond),
 	}
 
 	if err := u.txManager.Do(ctx, func(txCtx context.Context) error {

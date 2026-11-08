@@ -21,7 +21,7 @@ func TestExecute(t *testing.T) {
 	id := uuid.MustParse("fa73b327-7c76-4a44-9c4d-39eb684ca5a2")
 	userID := uuid.MustParse("5e17cf63-0784-43bc-9094-bb11d0d6ad0a")
 	driverID := uuid.MustParse("5def78c5-b00f-4650-ac21-98991e1788b7")
-	at := time.Date(2025, 4, 5, 12, 30, 0, 0, time.FixedZone("offset", 3*60*60))
+	at := time.Date(2025, 4, 5, 12, 30, 0, 768139851, time.FixedZone("offset", 3*60*60))
 	input := domain.CreateTrip{
 		UserID: userID, DriverID: driverID,
 		StartPoint: domain.Coordinates{Latitude: 10, Longitude: 20},
@@ -31,7 +31,7 @@ func TestExecute(t *testing.T) {
 	want := domain.Trip{
 		ID: id, UserID: userID, DriverID: driverID,
 		StartPoint: input.StartPoint, EndPoint: input.EndPoint,
-		Price: input.Price, Status: domain.TripStatusActive, StartedAt: at.UTC(),
+		Price: input.Price, Status: domain.TripStatusActive, StartedAt: at.UTC().Truncate(time.Microsecond),
 	}
 	insertErr := errors.New("insert failed")
 	historyErr := errors.New("history failed")

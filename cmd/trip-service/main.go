@@ -31,6 +31,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
 	logger := newServiceLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 

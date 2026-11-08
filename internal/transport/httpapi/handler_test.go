@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -91,7 +92,9 @@ func TestCreateTripBodyValidation(t *testing.T) {
 				service.EXPECT().Create(gomock.Any(), gomock.Any()).Return(sampleTrip(), nil).Times(1)
 			}
 			recorder := httptest.NewRecorder()
-			testRouter(service, testPinger(t)).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(test.body)))
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			testRouter(service, testPinger(t)).ServeHTTP(recorder, request)
 			if test.status == http.StatusCreated {
 				if recorder.Code != test.status {
 					t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -103,11 +106,148 @@ func TestCreateTripBodyValidation(t *testing.T) {
 	}
 }
 
-func TestGeneratedRouterRejectsInvalidTripID(t *testing.T) {
-	router := testRouter(testService(t), testPinger(t))
+func TestCreateTripDecodeErrorsHaveSafeDetails(t *testing.T) {
+	valid := `{"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c","driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5","start_point":{"latitude":1,"longitude":2},"end_point":{"latitude":3,"longitude":4},"price":10}`
+	for _, test := range []struct{ name, body, detail string }{
+		{"missing price", strings.TrimSuffix(valid, `,"price":10}`) + `}`, `required field "price" is missing`},
+		{"unknown field", strings.TrimSuffix(valid, `}`) + `,"surprise":true}`, "request body contains an unknown field"},
+		{"malformed JSON", `{`, "request body must be valid JSON"},
+		{"JSON array", `[]`, "request body must be a JSON object"},
+		{"trailing JSON", valid + `{}`, "request body must contain exactly one JSON object"},
+		{"trailing object", valid + ` {}`, "request body must contain exactly one JSON object"},
+		{"wrong type", strings.Replace(valid, `"price":10`, `"price":"secret"`, 1), "request body contains a field with the wrong type"},
+		{"invalid UUID", strings.Replace(valid, `5cb72c04-7650-45c9-a79b-bcdba0631e0c`, `secret-id`, 1), "request body contains an invalid field value"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := testService(t)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			testRouter(service, testPinger(t)).ServeHTTP(recorder, request)
+			problem := assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+			if problem.Detail == nil || *problem.Detail != test.detail {
+				t.Fatalf("detail = %v; expected %q", problem.Detail, test.detail)
+			}
+			if strings.Contains(recorder.Body.String(), "secret") {
+				t.Fatalf("request value leaked: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateTripRequiresNestedCoordinates(t *testing.T) {
+	for _, test := range []struct {
+		name, start, end, missing string
+	}{
+		{"start latitude missing", `{"longitude":2}`, `{"latitude":3,"longitude":4}`, "start_point.latitude"},
+		{"start longitude missing", `{"latitude":1}`, `{"latitude":3,"longitude":4}`, "start_point.longitude"},
+		{"end latitude missing", `{"latitude":1,"longitude":2}`, `{"longitude":4}`, "end_point.latitude"},
+		{"end longitude missing", `{"latitude":1,"longitude":2}`, `{"latitude":3}`, "end_point.longitude"},
+		{"start latitude null", `{"latitude":null,"longitude":2}`, `{"latitude":3,"longitude":4}`, "start_point.latitude"},
+		{"start longitude null", `{"latitude":1,"longitude":null}`, `{"latitude":3,"longitude":4}`, "start_point.longitude"},
+		{"end latitude null", `{"latitude":1,"longitude":2}`, `{"latitude":null,"longitude":4}`, "end_point.latitude"},
+		{"end longitude null", `{"latitude":1,"longitude":2}`, `{"latitude":3,"longitude":null}`, "end_point.longitude"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := testService(t)
+			body := `{"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c","driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5","start_point":` + test.start + `,"end_point":` + test.end + `,"price":10}`
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			testRouter(service, testPinger(t)).ServeHTTP(recorder, request)
+			problem := assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+			if problem.Detail == nil || !strings.Contains(*problem.Detail, test.missing) {
+				t.Fatalf("detail = %v, want field %q", problem.Detail, test.missing)
+			}
+		})
+	}
+}
+
+func TestCreateTripRejectsNonObjectCoordinatesAndOversizedBody(t *testing.T) {
+	for _, point := range []string{"start_point", "end_point"} {
+		t.Run(point+" null", func(t *testing.T) {
+			body := `{"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c","driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5","start_point":{"latitude":1,"longitude":2},"end_point":{"latitude":3,"longitude":4},"price":10}`
+			if point == "start_point" {
+				body = strings.Replace(body, `"start_point":{"latitude":1,"longitude":2}`, `"start_point":null`, 1)
+			} else {
+				body = strings.Replace(body, `"end_point":{"latitude":3,"longitude":4}`, `"end_point":null`, 1)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			testRouter(testService(t), testPinger(t)).ServeHTTP(recorder, request)
+			problem := assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+			if problem.Detail == nil || !strings.Contains(*problem.Detail, point) {
+				t.Fatalf("detail = %v", problem.Detail)
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(strings.Repeat(" ", (1<<20)+1)))
+	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/trips/not-a-uuid", nil))
-	assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+	testRouter(testService(t), testPinger(t)).ServeHTTP(recorder, request)
+	problem := assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+	if problem.Detail == nil || *problem.Detail != "request body exceeds the size limit" {
+		t.Fatalf("detail = %v", problem.Detail)
+	}
+}
+
+func TestCreateTripAcceptsZeroCoordinatesAndJSONCharset(t *testing.T) {
+	service := testService(t)
+	service.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, input domain.CreateTrip) (domain.Trip, error) {
+		if input.StartPoint != (domain.Coordinates{}) || input.EndPoint != (domain.Coordinates{}) {
+			t.Errorf("input = %#v, want zero coordinates", input)
+		}
+		return sampleTrip(), nil
+	})
+	body := `{"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c","driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5","start_point":{"latitude":0,"longitude":0},"end_point":{"latitude":0,"longitude":0},"price":0}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	recorder := httptest.NewRecorder()
+	testRouter(service, testPinger(t)).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCreateTripRejectsUnsupportedContentType(t *testing.T) {
+	for _, contentType := range []string{"", "text/plain", "application/problem+json", "application/json; charset=bogus"} {
+		t.Run(contentType, func(t *testing.T) {
+			service := testService(t)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(`{}`))
+			request.Header.Set("Content-Type", contentType)
+			recorder := httptest.NewRecorder()
+			testRouter(service, testPinger(t)).ServeHTTP(recorder, request)
+			problem := assertProblem(t, recorder, http.StatusUnsupportedMediaType, "invalid_request")
+			if problem.Detail == nil || *problem.Detail != "Content-Type must be application/json" {
+				t.Fatalf("detail = %v", problem.Detail)
+			}
+
+		})
+	}
+}
+
+func TestGeneratedRouterRejectsInvalidTripID(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	router := NewRouter(NewHandler(testService(t), testPinger(t), time.Second, logger))
+	for _, test := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/trips/not-a-uuid"},
+		{http.MethodPost, "/api/v1/trips/not-a-uuid/finish"},
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+		problem := assertProblem(t, recorder, http.StatusBadRequest, "invalid_request")
+		if problem.Detail == nil || *problem.Detail != "tripId must be a UUID" {
+			t.Fatalf("detail = %v", problem.Detail)
+		}
+		if strings.Contains(recorder.Body.String(), "unmarshaling") || strings.Contains(recorder.Body.String(), "*uuid.UUID") {
+			t.Fatalf("generated parser leaked into response: %s", recorder.Body.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "Invalid format for parameter tripId") {
+		t.Fatalf("original parser error absent from debug logs: %s", logs.String())
+	}
 }
 
 func TestDomainErrorsUseProblemJSON(t *testing.T) {
@@ -147,7 +287,11 @@ func TestDomainErrorsUseProblemJSON(t *testing.T) {
 				}
 				router := testRouter(service, testPinger(t))
 				recorder := httptest.NewRecorder()
-				router.ServeHTTP(recorder, httptest.NewRequest(endpoint.method, endpoint.path, strings.NewReader(body)))
+				request := httptest.NewRequest(endpoint.method, endpoint.path, strings.NewReader(body))
+				if endpoint.name == "create" {
+					request.Header.Set("Content-Type", "application/json")
+				}
+				router.ServeHTTP(recorder, request)
 				problem := assertProblem(t, recorder, test.status, test.code)
 				if problem.Detail == nil || *problem.Detail != test.detail {
 					t.Fatalf("detail = %v, want %q", problem.Detail, test.detail)

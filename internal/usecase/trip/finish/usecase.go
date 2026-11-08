@@ -33,7 +33,7 @@ func (uc *UseCase) Execute(ctx context.Context, id uuid.UUID) (domain.Trip, erro
 		if err != nil {
 			return err
 		}
-		at := uc.now().UTC()
+		at := uc.now().UTC().Truncate(time.Microsecond)
 		if err := current.Finish(at); err != nil {
 			return err
 		}

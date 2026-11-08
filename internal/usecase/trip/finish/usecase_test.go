@@ -20,8 +20,8 @@ const (
 
 func TestExecute(t *testing.T) {
 	id := uuid.MustParse("1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111")
-	local := time.Date(2026, 9, 24, 12, 0, 0, 0, time.FixedZone("local", 3600))
-	utc := local.UTC()
+	local := time.Date(2026, 9, 24, 12, 0, 0, 768139851, time.FixedZone("local", 3600))
+	utc := local.UTC().Truncate(time.Microsecond)
 	active := domain.Trip{ID: id, Status: domain.TripStatusActive}
 	completed := domain.Trip{ID: id, Status: domain.TripStatusCompleted, FinishedAt: &utc}
 	failure := errors.New("storage unavailable")
@@ -128,7 +128,7 @@ func TestExecuteWithoutHook(t *testing.T) {
 	repository := NewMocktripRepository(ctrl)
 	txManager := NewMocktxManager(ctrl)
 	id := uuid.New()
-	at := time.Now().UTC()
+	at := time.Now().UTC().Truncate(time.Microsecond)
 	completed := domain.Trip{ID: id, Status: domain.TripStatusCompleted, FinishedAt: &at}
 	ctx := context.Background()
 	txManager.EXPECT().Do(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, fn func(context.Context) error) error {

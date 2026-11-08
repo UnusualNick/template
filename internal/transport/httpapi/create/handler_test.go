@@ -37,6 +37,7 @@ func sampleTrip() domain.Trip {
 func serve(t *testing.T, mock *Mockusecase, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	New(mock).Handle(w, r)
 	return w
@@ -97,25 +98,45 @@ func TestHandleSuccess(t *testing.T) {
 }
 
 func TestHandleInvalidBody(t *testing.T) {
-	cases := []struct{ name, body string }{
-		{"missing start latitude", strings.Replace(validBody, `"latitude":1,`, "", 1)},
-		{"missing start longitude", strings.Replace(validBody, `,"longitude":2`, "", 1)},
-		{"missing end latitude", strings.Replace(validBody, `"latitude":3,`, "", 1)},
-		{"missing end longitude", strings.Replace(validBody, `,"longitude":4`, "", 1)},
-		{"null coordinate", strings.Replace(validBody, `"latitude":1`, `"latitude":null`, 1)},
-		{"missing top-level field", strings.Replace(validBody, `,"price":10`, "", 1)},
-		{"null point", strings.Replace(validBody, `"start_point":{"latitude":1,"longitude":2}`, `"start_point":null`, 1)},
-		{"unknown top-level field", strings.Replace(validBody, `"price":10`, `"price":10,"extra":true`, 1)},
-		{"unknown nested field", strings.Replace(validBody, `"latitude":1`, `"latitude":1,"altitude":10`, 1)},
-		{"malformed JSON", "{"},
-		{"non-object JSON", "[]"},
-		{"trailing JSON", validBody + " {}"},
-		{"body over 1 MiB", validBody + strings.Repeat(" ", 1<<20)},
+	cases := []struct{ name, body, detail string }{
+		{"missing start latitude", strings.Replace(validBody, `"latitude":1,`, "", 1), `required field "start_point.latitude" is missing`},
+		{"missing start longitude", strings.Replace(validBody, `,"longitude":2`, "", 1), `required field "start_point.longitude" is missing`},
+		{"missing end latitude", strings.Replace(validBody, `"latitude":3,`, "", 1), `required field "end_point.latitude" is missing`},
+		{"missing end longitude", strings.Replace(validBody, `,"longitude":4`, "", 1), `required field "end_point.longitude" is missing`},
+		{"null coordinate", strings.Replace(validBody, `"latitude":1`, `"latitude":null`, 1), `required field "start_point.latitude" is missing`},
+		{"missing top-level field", strings.Replace(validBody, `,"price":10`, "", 1), `required field "price" is missing`},
+		{"null point", strings.Replace(validBody, `"start_point":{"latitude":1,"longitude":2}`, `"start_point":null`, 1), `required field "start_point" is missing`},
+		{"wrong point type", strings.Replace(validBody, `"end_point":{"latitude":3,"longitude":4}`, `"end_point":[]`, 1), `field "end_point" must be a JSON object`},
+		{"unknown top-level field", strings.Replace(validBody, `"price":10`, `"price":10,"extra":true`, 1), "request body contains an unknown field"},
+		{"unknown nested field", strings.Replace(validBody, `"latitude":1`, `"latitude":1,"altitude":10`, 1), "request body contains an unknown field"},
+		{"malformed JSON", "{", "request body must be valid JSON"},
+		{"non-object JSON", "[]", "request body must be a JSON object"},
+		{"trailing JSON", validBody + " {}", "request body must contain exactly one JSON object"},
+		{"wrong field type", strings.Replace(validBody, `"price":10`, `"price":"secret"`, 1), "request body contains a field with the wrong type"},
+		{"invalid UUID", strings.Replace(validBody, "5cb72c04-7650-45c9-a79b-bcdba0631e0c", "secret-id", 1), "request body contains an invalid field value"},
+		{"body over 1 MiB", validBody + strings.Repeat(" ", 1<<20), "request body exceeds the size limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := NewMockusecase(gomock.NewController(t))
-			assertProblem(t, serve(t, mock, tc.body), http.StatusBadRequest, "invalid_request", "Request body is not valid JSON")
+			w := serve(t, mock, tc.body)
+			assertProblem(t, w, http.StatusBadRequest, "invalid_request", tc.detail)
+			if strings.Contains(w.Body.String(), "secret") {
+				t.Fatalf("request value leaked: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleContentType(t *testing.T) {
+	for _, contentType := range []string{"", "text/plain", "application/problem+json", "application/json; charset=bogus"} {
+		t.Run(contentType, func(t *testing.T) {
+			mock := NewMockusecase(gomock.NewController(t))
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/trips", strings.NewReader(validBody))
+			r.Header.Set("Content-Type", contentType)
+			w := httptest.NewRecorder()
+			New(mock).Handle(w, r)
+			assertProblem(t, w, http.StatusUnsupportedMediaType, "invalid_request", "Content-Type must be application/json")
 		})
 	}
 }

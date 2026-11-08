@@ -21,8 +21,9 @@ tripgoctl cluster start
 tripgoctl environment start
 tripgoctl connect
 
-# tripgoctl создаёт .env с адресами сервисов. Таймауты берём из .env.example:
-# в файле курса их нет.
+# environment start создаёт .env с актуальными адресами сервисов.
+# Таймауты и прочие значения по умолчанию берём из .env.example,
+# затем настройки окружения курса перекрывают их.
 set -a
 . ./.env.example
 . ./.env
@@ -75,12 +76,11 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 
 ## Как сдавать
 
-[ЛР1](https://github.com/UnusualNick/template/pull/1) отправлена из `homework/01`,
-[ЛР2](https://github.com/UnusualNick/template/pull/2) — из `homework/02` в `main`
-того же форка. ЛР1 ещё на ревью, поэтому `homework/02` ответвлена от неё. Когда
-первую работу примут, нужно обновить основание второго PR; закрывать первый PR
-ради этого не надо. Ссылку отдельно отправлять не требуется — ревьюер увидит
-PR в форке. Остальные правила сдачи есть в `grading.md` репозитория курса.
+[ЛР1](https://github.com/UnusualNick/template/pull/1) принята в `main`.
+[ЛР2](https://github.com/UnusualNick/template/pull/2) отправлена из `homework/02`
+в `main` того же форка. Остальные правила сдачи есть в `grading.md`
+репозитория курса.
+
 
 ## Конфигурация
 
@@ -235,12 +235,34 @@ go build ./...
 
 ## Docker (дополнительная часть)
 
+После `tripgoctl connect` и `make migrate` из быстрого запуска соберите образ:
+
 ```bash
 docker build -t tripgo-trip-service -f deploy/Dockerfile .
-docker run --rm --env-file .env.example --env-file .env -p 8080:8080 tripgo-trip-service
 ```
 
-Сборка двухэтапная; в финальном distroless-образе нет исходников и Go toolchain,
-процесс работает не от root. Перед `docker run` проверьте адреса БД и OTLP в
-переменных окружения: `localhost` внутри контейнера не указывает на хост.
-Размер образа для ЛР2 отдельно не измерялся.
+На Linux запустите с сетью хоста: адрес `localhost` в `DATABASE_URL` и адресе
+OTLP-коллектора тогда указывает на ту же машину, что и при `make run`.
+
+```bash
+docker run --rm --network host --env-file .env.example --env-file .env tripgo-trip-service
+```
+
+На macOS (Docker Desktop) контейнеру нужен адрес хоста `host.docker.internal`:
+
+```bash
+docker run --rm --env-file .env.example --env-file .env \
+  -e "DATABASE_URL=${DATABASE_URL/localhost/host.docker.internal}" \
+  -e "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT/localhost/host.docker.internal}" \
+  -p 8080:8080 tripgo-trip-service
+```
+
+Команды выполняются в том же Bash-сеансе, где загружены переменные из быстрого
+запуска. `.env` перекрывает `.env.example`; на macOS параметры `-e` заменяют
+`localhost` в адресах БД и OTLP на адрес хоста Docker Desktop. Если
+`tripgoctl connect` выдал другие адреса, проверьте, что они доступны из
+контейнера.
+
+Образ собирается в два этапа. Финальный слой основан на distroless, не содержит
+исходников и Go toolchain и запускается от non-root пользователя. Размер образа
+для ЛР2 отдельно не измерялся (для ЛР1 на `linux/arm64` он составлял 19.7 MB).
