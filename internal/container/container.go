@@ -4,8 +4,10 @@ package container
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,20 +16,29 @@ import (
 
 	"github.com/UnusualNick/template/internal/config"
 	"github.com/UnusualNick/template/internal/domain"
+	"github.com/UnusualNick/template/internal/gateway/push"
 	"github.com/UnusualNick/template/internal/observability"
 	"github.com/UnusualNick/template/internal/storage/postgres"
 	"github.com/UnusualNick/template/internal/transport/httpapi"
+	httppositions "github.com/UnusualNick/template/internal/transport/httpapi/positions"
 	tripcreate "github.com/UnusualNick/template/internal/usecase/trip/create"
 	tripfinish "github.com/UnusualNick/template/internal/usecase/trip/finish"
 	tripget "github.com/UnusualNick/template/internal/usecase/trip/get"
+	positionlist "github.com/UnusualNick/template/internal/usecase/trip/positions/list"
+	positionsave "github.com/UnusualNick/template/internal/usecase/trip/positions/save"
+	positionworker "github.com/UnusualNick/template/internal/worker/positions"
 )
 
 // App owns the server and resources created by New.
 type App struct {
 	Server            *http.Server
 	pool              *pgxpool.Pool
+	worker            *positionworker.Worker
+	push              *push.Client
 	telemetryShutdown func(context.Context) error
 	logger            *slog.Logger
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 // tripActions adapts the three independently tested actions to the generated
@@ -105,15 +116,48 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 		pool.Close()
 		return nil, err
 	}
+	positionMetrics, err := observability.NewPositionMetrics()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	pushClient, err := push.New(cfg.PushHTTPURL, cfg.PushRequestTimeout)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
 	txManager := postgres.NewTxManager(pool)
 	repository := postgres.NewTripRepository(txManager, cfg.DatabaseQueryTimeout)
+	worker, err := positionworker.New(repository, pushClient, positionworker.Config{
+		Interval: cfg.PositionCheckInterval, StaleAfter: cfg.PositionStaleAfter,
+		RequestTimeout: cfg.PushRequestTimeout, Workers: cfg.PositionWorkers,
+		QueueCapacity: cfg.PositionQueueSize, Logger: logger,
+		Hooks: positionworker.Hooks{
+			OnStaleCheck: positionMetrics.StaleCheck, OnQueueDepth: positionMetrics.QueueDepth,
+			OnWorkersActive: positionMetrics.WorkersActive, OnRequest: positionMetrics.Request,
+		},
+	})
+	if err != nil {
+		pushClient.CloseIdleConnections()
+		pool.Close()
+		return nil, err
+	}
+	positionMetrics.QueueDepth(0)
+	positionMetrics.WorkersActive(0)
+	positionSave := positionsave.New(repository, txManager, nil, func(ctx context.Context, tripID uuid.UUID) {
+		worker.PositionArrived(tripID)
+		positionMetrics.Saved(ctx)
+	})
+	positionList := positionlist.New(repository)
 	tripActions := tripActions{
 		create: tripcreate.New(repository, txManager, nil, nil, counters.Created),
 		get:    tripget.New(repository),
 		finish: tripfinish.New(repository, txManager, counters.Completed),
 		logger: logger,
 	}
-	handler := httpapi.NewHandler(tripActions, pool, cfg.DatabaseQueryTimeout, logger)
+	handler := httpapi.NewHandler(tripActions, pool, cfg.DatabaseQueryTimeout, logger, httpapi.PositionHandlers{
+		Create: httppositions.NewCreate(positionSave), List: httppositions.NewList(positionList),
+	})
 	// chi installs these outside the routes, preserving a stable route template.
 	// Outer to inner: Recover → Tracing → Logging → Metrics → routes.
 	routes := httpapi.NewRouter(handler,
@@ -121,7 +165,13 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 		observability.Logging(logger), observability.HTTPMiddleware(logger),
 	)
 
-	return &App{pool: pool, telemetryShutdown: telemetryShutdown, logger: logger, Server: &http.Server{
+	if err := worker.Start(context.Background()); err != nil {
+		pushClient.CloseIdleConnections()
+		pool.Close()
+		return nil, err
+	}
+	logger.Info("positions worker started", "workers", cfg.PositionWorkers, "queue_capacity", cfg.PositionQueueSize)
+	return &App{pool: pool, worker: worker, push: pushClient, telemetryShutdown: telemetryShutdown, logger: logger, Server: &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           routes,
 		ReadTimeout:       cfg.HTTPReadTimeout,
@@ -131,19 +181,46 @@ func New(cfg config.Config, logger *slog.Logger) (_ *App, err error) {
 	}}, nil
 }
 
-// Close releases resources after the HTTP server has stopped.
-func (a *App) Close() {
+// Close runs after the HTTP server has stopped: stop new scans, drain workers
+// within ctx, close the Push client and database pool, then flush telemetry.
+// When called without a context by older consumers, use a bounded fallback.
+func (a *App) Close(shutdownContexts ...context.Context) error {
 	if a == nil {
-		return
+		return nil
 	}
-	if a.pool != nil {
-		a.pool.Close()
-	}
-	if a.telemetryShutdown != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx := context.Background()
+	if len(shutdownContexts) != 0 && shutdownContexts[0] != nil {
+		ctx = shutdownContexts[0]
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := a.telemetryShutdown(ctx); err != nil && a.logger != nil {
-			a.logger.Warn("telemetry shutdown failed", "error", err)
-		}
 	}
+	a.closeOnce.Do(func() {
+		if a.worker != nil {
+			if err := a.worker.Stop(ctx); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+				if a.logger != nil {
+					a.logger.Warn("positions worker shutdown timed out", "error.type", "timeout")
+				}
+			} else if a.logger != nil {
+				a.logger.Info("positions worker stopped")
+			}
+		}
+		if a.push != nil {
+			a.push.CloseIdleConnections()
+		}
+		if a.pool != nil {
+			a.pool.Close()
+		}
+		if a.telemetryShutdown != nil {
+			if err := a.telemetryShutdown(ctx); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+				if a.logger != nil {
+					a.logger.Warn("telemetry shutdown failed", "error", err)
+				}
+			}
+		}
+	})
+	return a.closeErr
 }

@@ -8,10 +8,14 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/UnusualNick/template/internal/domain"
+	positionworker "github.com/UnusualNick/template/internal/worker/positions"
 )
 
 func TestLogTripEventIncludesIDOnlyInLog(t *testing.T) {
@@ -33,6 +37,84 @@ func TestLogTripEventIncludesIDOnlyInLog(t *testing.T) {
 	span.End()
 	if spans := recorder.Ended(); len(spans) != 1 || len(spans[0].Attributes()) != 0 {
 		t.Fatalf("trip ID must not become a span attribute: %v", spans)
+	}
+}
+
+type shutdownStaleSource struct {
+	trip     domain.Trip
+	contexts chan context.Context
+}
+
+func (s shutdownStaleSource) ListStale(ctx context.Context, _ time.Time) ([]domain.Trip, error) {
+	s.contexts <- ctx
+	return []domain.Trip{s.trip}, nil
+}
+
+type shutdownRequester struct {
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (r shutdownRequester) RequestPosition(ctx context.Context, _, _ uuid.UUID) error {
+	close(r.entered)
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestCloseDrainsWorkerBeforeFlushingTelemetry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	ticks := make(chan time.Time, 1)
+	source := shutdownStaleSource{trip: domain.Trip{ID: uuid.New(), DriverID: uuid.New(), Status: domain.TripStatusActive}, contexts: make(chan context.Context, 1)}
+	entered := make(chan struct{})
+	released := make(chan struct{})
+	requester := shutdownRequester{entered: entered, release: released}
+	worker, err := positionworker.New(source, requester, positionworker.Config{
+		Interval: time.Minute, StaleAfter: time.Minute, RequestTimeout: 5 * time.Second,
+		Workers: 1, QueueCapacity: 1, Tick: ticks, Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ticks <- time.Now()
+	scanCtx := <-source.contexts
+	<-entered
+	telemetry := make(chan struct{})
+	app := &App{worker: worker, logger: logger, telemetryShutdown: func(context.Context) error {
+		close(telemetry)
+		return nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- app.Close(ctx) }()
+	select { // Stop has canceled the scanner, but the Push call is still active.
+	case <-scanCtx.Done():
+	case <-ctx.Done():
+		t.Fatal("scanner did not stop within the shutdown deadline")
+	}
+	select {
+	case <-telemetry:
+		t.Fatal("telemetry closed before worker drained")
+	default:
+	}
+	close(released)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-telemetry:
+	default:
+		t.Fatal("telemetry was not flushed after worker shutdown")
+	}
+	if err := app.Close(ctx); err != nil {
+		t.Fatalf("repeated Close() error = %v", err)
 	}
 }
 

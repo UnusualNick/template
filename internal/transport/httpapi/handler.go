@@ -1,5 +1,5 @@
 // Package httpapi adapts the generated OpenAPI server to action-specific HTTP
-// handlers. Business rules live in the three independent usecase packages.
+// handlers. Business rules live in independent usecase packages.
 //
 //go:generate sh -c "go run go.uber.org/mock/mockgen -source=handler.go -destination=mocks_test.go -package=httpapi -mock_names=tripService=MockTripService,databasePinger=MockDatabasePinger && sed -n '/^..go:generate /p' handler.go >> mocks_test.go"
 package httpapi
@@ -21,6 +21,7 @@ import (
 	httpcreate "github.com/UnusualNick/template/internal/transport/httpapi/create"
 	httpfinish "github.com/UnusualNick/template/internal/transport/httpapi/finish"
 	httpget "github.com/UnusualNick/template/internal/transport/httpapi/get"
+	httppositions "github.com/UnusualNick/template/internal/transport/httpapi/positions"
 )
 
 // The generated server needs one adapter, while each action handler owns a
@@ -35,20 +36,32 @@ type databasePinger interface {
 	Ping(ctx context.Context) error
 }
 
+// PositionHandlers wires the two position actions without widening the trip
+// service interface. It is optional for callers that only use the LR2 routes.
+type PositionHandlers struct {
+	Create *httppositions.CreateHandler
+	List   *httppositions.ListHandler
+}
+
 type Handler struct {
 	create       *httpcreate.Handler
 	get          *httpget.Handler
 	finish       *httpfinish.Handler
+	positions    PositionHandlers
 	database     databasePinger
 	queryTimeout time.Duration
 	logger       *slog.Logger
 }
 
-func NewHandler(service tripService, database databasePinger, queryTimeout time.Duration, logger *slog.Logger) *Handler {
-	return &Handler{
+func NewHandler(service tripService, database databasePinger, queryTimeout time.Duration, logger *slog.Logger, positionHandlers ...PositionHandlers) *Handler {
+	handler := &Handler{
 		create: httpcreate.New(service), get: httpget.New(service), finish: httpfinish.New(service),
 		database: database, queryTimeout: queryTimeout, logger: logger,
 	}
+	if len(positionHandlers) > 0 {
+		handler.positions = positionHandlers[0]
+	}
+	return handler
 }
 
 // NewRouter registers route-aware middleware inside chi so instrumentation
@@ -85,6 +98,22 @@ func (h *Handler) GetTrip(w http.ResponseWriter, r *http.Request, tripID api.Tri
 
 func (h *Handler) FinishTrip(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
 	h.finish.Handle(w, r, tripID)
+}
+
+func (h *Handler) CreateTripPosition(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
+	if h.positions.Create == nil {
+		h.WriteInternalError(w, r)
+		return
+	}
+	h.positions.Create.Handle(w, r, tripID)
+}
+
+func (h *Handler) ListTripPositions(w http.ResponseWriter, r *http.Request, tripID api.TripId) {
+	if h.positions.List == nil {
+		h.WriteInternalError(w, r)
+		return
+	}
+	h.positions.List.Handle(w, r, tripID)
 }
 
 func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {

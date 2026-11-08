@@ -23,6 +23,13 @@ type Config struct {
 	DatabaseMaxConnLifetime time.Duration
 	DatabaseConnectTimeout  time.Duration
 	DatabaseQueryTimeout    time.Duration
+
+	PositionCheckInterval time.Duration
+	PositionStaleAfter    time.Duration
+	PositionWorkers       int
+	PositionQueueSize     int
+	PushHTTPURL           string
+	PushRequestTimeout    time.Duration
 }
 
 func Load() (Config, error) {
@@ -69,6 +76,28 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.DatabaseQueryTimeout, err = duration("DATABASE_QUERY_TIMEOUT"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PositionCheckInterval, err = duration("POSITION_CHECK_INTERVAL"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PositionStaleAfter, err = duration("POSITION_STALE_AFTER"); err != nil {
+		return Config{}, err
+	}
+	var workers int32
+	if workers, err = positiveInt32("POSITION_WORKERS"); err != nil {
+		return Config{}, err
+	}
+	cfg.PositionWorkers = int(workers)
+	var queueSize int32
+	if queueSize, err = positiveInt32("POSITION_QUEUE_SIZE"); err != nil {
+		return Config{}, err
+	}
+	cfg.PositionQueueSize = int(queueSize)
+	if cfg.PushHTTPURL, err = required("PUSH_HTTP_URL"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PushRequestTimeout, err = duration("PUSH_REQUEST_TIMEOUT"); err != nil {
 		return Config{}, err
 	}
 
