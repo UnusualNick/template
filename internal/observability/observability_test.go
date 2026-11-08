@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -242,6 +243,41 @@ func assertRecoveryPanicLog(t *testing.T, event map[string]any, span trace.SpanC
 		event["trace_id"] != span.TraceID().String() || event["span_id"] != span.SpanID().String() ||
 		event["http.route"] != "/private/{id}" {
 		t.Errorf("uncorrelated panic log: %v", event)
+	}
+}
+
+type untrustedRuntimePanic struct{}
+
+func (untrustedRuntimePanic) Error() string { panic("private panic text") }
+func (untrustedRuntimePanic) RuntimeError() {}
+
+func TestRecoverLogsOnlySafeRuntimePanicKind(t *testing.T) {
+	if got := safePanicValue(untrustedRuntimePanic{}); got != redactedPanicValue {
+		t.Fatalf("untrusted runtime panic = %q, want redacted", got)
+	}
+	if got := safePanicValue((*runtime.TypeAssertionError)(nil)); got != redactedPanicValue {
+		t.Fatalf("nil runtime panic = %q, want redacted", got)
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	router := chi.NewRouter()
+	router.Use(Recover(logger))
+	router.Get("/panic", func(http.ResponseWriter, *http.Request) {
+		values := make([]int, 0)
+		_ = values[0] //nolint:gosec // Deliberately trigger a bounds panic to test safe logging.
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("response status = %d, want 500", recorder.Code)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
+		t.Fatalf("decode panic log: %v", err)
+	}
+	if event["panic.value"] != panicIndexOutOfRange || strings.Contains(logs.String(), "private panic text") {
+		t.Fatalf("unsafe or missing runtime panic kind: %v", event)
 	}
 }
 

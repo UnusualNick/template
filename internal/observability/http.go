@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
+	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/felixge/httpsnoop"
@@ -19,15 +22,19 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const unmatchedRoute = "unmatched"
+const (
+	unmatchedRoute       = "unmatched"
+	redactedPanicValue   = "[redacted]"
+	panicIndexOutOfRange = "runtime error: index out of range"
+)
 
 // Recover runs outside Tracing, so it needs a request-scoped handoff to log
 // the server span's IDs after the inner middleware unwinds on a panic.
 type recoverySpanContextKey struct{}
 
-// Recover catches panics and logs their type, redacting arbitrary panic values
-// that can contain secrets or PII. Register it first (outermost) on chi. The
-// optional writer keeps production problem responses consistent with HTTP errors.
+// Recover catches panics and logs their type plus a safe runtime failure kind,
+// redacting arbitrary values that can contain secrets or PII. Register it first
+// (outermost) on chi. The optional writer keeps problem responses consistent.
 func Recover(logger *slog.Logger, internalErrorWriter ...func(http.ResponseWriter, *http.Request)) func(http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -47,7 +54,7 @@ func Recover(logger *slog.Logger, internalErrorWriter ...func(http.ResponseWrite
 			})
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					attrs := []any{"http.request.method", r.Method, "http.route", route(r), "panic.type", fmt.Sprintf("%T", recovered), "panic.value", "[redacted]", "stack", string(debug.Stack())}
+					attrs := []any{"http.request.method", r.Method, "http.route", route(r), "panic.type", fmt.Sprintf("%T", recovered), "panic.value", safePanicValue(recovered), "stack", string(debug.Stack())}
 					if spanContext.IsValid() {
 						attrs = append(attrs, "trace_id", spanContext.TraceID().String(), "span_id", spanContext.SpanID().String())
 					}
@@ -75,6 +82,39 @@ func Recover(logger *slog.Logger, internalErrorWriter ...func(http.ResponseWrite
 			next.ServeHTTP(response, r)
 		})
 	}
+}
+
+// safePanicValue records only recognized runtime failure kinds. The original
+// error can include untrusted input (even when it implements runtime.Error), so
+// neither arbitrary text nor index values become log attributes.
+func safePanicValue(recovered any) string {
+	runtimeErr, ok := recovered.(runtime.Error)
+	if !ok {
+		return redactedPanicValue
+	}
+	panicType := reflect.TypeOf(recovered)
+	if panicType.Kind() == reflect.Pointer && reflect.ValueOf(recovered).IsNil() {
+		return redactedPanicValue
+	}
+	for panicType.Kind() == reflect.Pointer {
+		panicType = panicType.Elem()
+	}
+	if panicType.PkgPath() != "runtime" {
+		return redactedPanicValue
+	}
+	message := runtimeErr.Error()
+	for _, kind := range []string{
+		panicIndexOutOfRange,
+		"runtime error: slice bounds out of range",
+		"runtime error: invalid memory address or nil pointer dereference",
+		"runtime error: integer divide by zero",
+		"runtime error: hash of unhashable type",
+	} {
+		if strings.HasPrefix(message, kind) {
+			return kind
+		}
+	}
+	return redactedPanicValue
 }
 
 // Tracing starts a server span without recording the raw URL. In particular,
