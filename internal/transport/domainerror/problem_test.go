@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	validationPriceField = "price"
-	genericInputDetail   = "Invalid trip input"
+	validationPriceField   = "price"
+	genericInputDetail     = "Invalid trip input"
+	positionLatitudeReason = "must be between -90 and 90"
+	recordedAtField        = "recorded_at"
 )
 
 func TestProblemMapsDomainErrorsWithoutLeakingWrappedDetails(t *testing.T) {
@@ -44,12 +46,21 @@ func TestProblemShowsOnlyKnownFieldValidation(t *testing.T) {
 		name, field, reason, want string
 	}{
 		{validationPriceField, validationPriceField, "must not be negative", "price: must not be negative"},
-		{"coordinates", "start_point.latitude", "must be between -90 and 90", "start_point.latitude: must be between -90 and 90"},
+		{"coordinates", "start_point.latitude", positionLatitudeReason, "start_point.latitude: must be between -90 and 90"},
 		{"status", "status", "must be active", "status: must be active"},
+		{"trip ID", "trip_id", "must be a non-zero UUID", "trip_id: must be a non-zero UUID"},
+		{"position latitude", "coordinates.latitude", positionLatitudeReason, "coordinates.latitude: must be between -90 and 90"},
+		{"position longitude", "coordinates.longitude", "must be between -180 and 180", "coordinates.longitude: must be between -180 and 180"},
+		{"missing timestamp", recordedAtField, "must be provided", "recorded_at: must be provided"},
+		{"future timestamp", recordedAtField, "must not be more than one minute in the future", "recorded_at: must not be more than one minute in the future"},
 		{"unknown field", "database_password", "must not be negative", genericInputDetail},
 		{"unknown field empty reason", "database_password", "", genericInputDetail},
 		{"unknown reason", validationPriceField, "private credentials", genericInputDetail},
 		{"empty reason", validationPriceField, "", genericInputDetail},
+		{"position unknown reason", recordedAtField, "private", genericInputDetail},
+		{"position unknown field", "coordinates.altitude", positionLatitudeReason, genericInputDetail},
+		{"position mismatched reason", "coordinates.longitude", positionLatitudeReason, genericInputDetail},
+		{"position injected reason", recordedAtField, "must be provided: secret", genericInputDetail},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := fmt.Errorf("wrapped private credentials: %w", &domain.FieldError{Field: tc.field, Reason: tc.reason})

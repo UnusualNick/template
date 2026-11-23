@@ -23,6 +23,7 @@ import (
 	"github.com/UnusualNick/template/api"
 	"github.com/UnusualNick/template/internal/domain"
 	"github.com/UnusualNick/template/internal/observability"
+	httppositions "github.com/UnusualNick/template/internal/transport/httpapi/positions"
 )
 
 func testService(t *testing.T) *MockTripService {
@@ -378,6 +379,48 @@ func TestGeneratedRoutesGiveActiveMetricTemplate(t *testing.T) {
 		}
 	}
 	t.Fatal("no balanced active-request metric with generated route template")
+}
+
+func TestPositionRoutesUseGeneratedRouter(t *testing.T) {
+	id := uuid.MustParse("1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111")
+	position := domain.TripPosition{
+		ID: 42, TripID: id, Coordinates: domain.Coordinates{Latitude: 59.93, Longitude: 30.33},
+		RecordedAt: time.Date(2026, 8, 24, 12, 0, 5, 0, time.UTC),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	save := NewMockPositionSaveUsecase(gomock.NewController(t))
+	save.EXPECT().Execute(gomock.Any(), id, domain.CreatePosition{
+		Coordinates: position.Coordinates, RecordedAt: position.RecordedAt,
+	}).Return(position, nil)
+	list := NewMockPositionListUsecase(gomock.NewController(t))
+	list.EXPECT().Execute(gomock.Any(), id).Return([]domain.TripPosition{position}, nil)
+	handler := NewHandler(testService(t), testPinger(t), time.Second, logger, PositionHandlers{
+		Create: httppositions.NewCreate(save),
+		List:   httppositions.NewList(list),
+	})
+	router := NewRouter(handler)
+	path := "/api/v1/trips/" + id.String() + "/positions"
+	body := `{"coordinates":{"latitude":59.93,"longitude":30.33},"recorded_at":"2026-08-24T12:00:05Z"}`
+	createdRequest := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	createdRequest.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	router.ServeHTTP(created, createdRequest)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create position status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var saved api.TripPosition
+	if err := json.Unmarshal(created.Body.Bytes(), &saved); err != nil || saved.Id != position.ID || saved.TripId != id {
+		t.Fatalf("created position = %#v, err = %v", saved, err)
+	}
+	listed := httptest.NewRecorder()
+	router.ServeHTTP(listed, httptest.NewRequest(http.MethodGet, path, nil))
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list positions status = %d, body = %s", listed.Code, listed.Body.String())
+	}
+	var route api.TripPositionsResponse
+	if err := json.Unmarshal(listed.Body.Bytes(), &route); err != nil || len(route.Positions) != 1 || route.Positions[0].Id != position.ID {
+		t.Fatalf("listed positions = %#v, err = %v", route, err)
+	}
 }
 
 func testRouter(service tripService, pinger databasePinger) http.Handler {

@@ -1,0 +1,91 @@
+PR3 stale-trip query EXPLAIN on isolated PostgreSQL 16 Docker container, local-only port 15432; 10000 synthetic active trips; no planner flags changed.
+INSERT 0 10000
+ANALYZE
+ total_trips | stale_trips
+-------------+-------------
+       10000 |          30
+(1 row)
+
+ enable_seqscan
+----------------
+ on
+(1 row)
+
+ enable_bitmapscan
+-------------------
+ on
+(1 row)
+
+                                                        QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=661.02..669.36 rows=3333 width=127) (actual time=0.700..0.701 rows=30 loops=1)
+   Sort Key: (COALESCE(last_position_at, started_at)), id
+   Sort Method: quicksort  Memory: 29kB
+   Buffers: shared hit=266
+   ->  Seq Scan on trips  (cost=0.00..466.00 rows=3333 width=127) (actual time=0.023..0.684 rows=30 loops=1)
+         Filter: ((status = 'active'::text) AND (COALESCE(last_position_at, started_at) < (now() - '01:00:00'::interval)))
+         Rows Removed by Filter: 9970
+         Buffers: shared hit=266
+ Planning:
+   Buffers: shared hit=49
+ Planning Time: 0.181 ms
+ Execution Time: 0.717 ms
+(12 rows)
+
+BEFORE above: migrated index alone; ordinary planner chose Seq Scan and estimated 3333 rows, actual 30.
+AFTER below: in this disposable DB ran CREATE STATISTICS trips_active_stale_expr_stats ON (COALESCE(last_position_at, started_at)) FROM trips; ANALYZE trips; both planner scan switches remain ON.
+This isolated manual statistics experiment motivated additive migration 00004; re-run against that migration before claiming it proves committed code.
+            stxname            | stxkind
+-------------------------------+---------
+ trips_active_stale_expr_stats | {e}
+(1 row)
+
+ total_trips | stale_trips
+-------------+-------------
+       10200 |         230
+(1 row)
+
+ enable_seqscan
+----------------
+ on
+(1 row)
+
+ enable_bitmapscan
+-------------------
+ on
+(1 row)
+
+                                                                 QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=295.93..296.50 rows=230 width=127) (actual time=0.148..0.153 rows=230 loops=1)
+   Sort Key: (COALESCE(last_position_at, started_at)), id
+   Sort Method: quicksort  Memory: 57kB
+   Buffers: shared hit=14
+   ->  Bitmap Heap Scan on trips  (cost=14.07..286.90 rows=230 width=127) (actual time=0.026..0.046 rows=230 loops=1)
+         Recheck Cond: ((COALESCE(last_position_at, started_at) < (now() - '01:00:00'::interval)) AND (status = 'active'::text))
+         Heap Blocks: exact=5
+         Buffers: shared hit=8
+         ->  Bitmap Index Scan on trips_active_stale_at_idx  (cost=0.00..14.02 rows=230 width=0) (actual time=0.022..0.022 rows=230 loops=1)
+               Index Cond: (COALESCE(last_position_at, started_at) < (now() - '01:00:00'::interval))
+               Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=67
+ Planning Time: 0.280 ms
+ Execution Time: 0.217 ms
+(15 rows)
+
+
+AFTER additive migration 00004 on same isolated DB, after deleting all 10200 prior synthetic fixtures: test inserts 3000 synthetic trips inside rollback transaction, ANALYZE; no planner flags forced; test asserts index scan.
+Command: go test -race -tags=integration -run "^TestPositionStaleIndexPlan$" -count=1 -v ./internal/storage/postgres
+=== RUN   TestPositionStaleIndexPlan
+    position_repository_integration_test.go:268: unforced stale query plan over 3000 trips (30 stale):
+        Index Scan using trips_active_stale_at_idx on trips  (cost=0.28..58.87 rows=30 width=127) (actual time=0.012..0.018 rows=30 loops=1)
+          Index Cond: (COALESCE(last_position_at, started_at) < '2026-11-23 08:39:45.177685+00'::timestamp with time zone)
+          Buffers: shared hit=7
+        Planning:
+          Buffers: shared hit=97
+        Planning Time: 0.395 ms
+        Execution Time: 0.033 ms
+--- PASS: TestPositionStaleIndexPlan (0.04s)
+PASS
+ok  	github.com/UnusualNick/template/internal/storage/postgres	1.047s

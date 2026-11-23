@@ -39,7 +39,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer app.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			if closeErr := app.Close(cleanupCtx); closeErr != nil {
+				logger.Warn("resource shutdown failed", "error", closeErr)
+			}
+		}
+	}()
 
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -62,11 +71,18 @@ func run() error {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancelShutdown()
 	if err := app.Server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("graceful shutdown timed out", "error", err)
-		if closeErr := app.Server.Close(); closeErr != nil {
-			return errors.Join(err, closeErr)
-		}
-		return err
+		logger.Error("graceful HTTP shutdown failed", "error", err)
+		serverCloseErr := app.Server.Close()
+		resourceCloseErr := app.Close(shutdownCtx)
+		closed = true
+		return errors.Join(err, serverCloseErr, resourceCloseErr)
+	}
+	// The worker stops scanning and drains queued work before the Push client and
+	// database are closed, all under the same shutdown deadline as HTTP.
+	closeErr := app.Close(shutdownCtx)
+	closed = true
+	if closeErr != nil {
+		return closeErr
 	}
 	logger.Info("shutdown complete")
 	return nil

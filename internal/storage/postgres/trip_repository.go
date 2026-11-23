@@ -16,7 +16,7 @@ import (
 
 const tripColumns = `id, user_id, driver_id,
 start_latitude, start_longitude, end_latitude, end_longitude,
-price, status, started_at, finished_at, NULL::timestamptz AS last_position_at`
+price, status, started_at, finished_at, last_position_at`
 
 type executorProvider interface {
 	Executor(ctx context.Context) DBTX

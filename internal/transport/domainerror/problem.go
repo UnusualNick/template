@@ -4,6 +4,7 @@ package domainerror
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/UnusualNick/template/api"
@@ -24,7 +25,7 @@ func Problem(err error) (int, api.Problem) {
 		detail := "Invalid trip input"
 		var fieldErr *domain.FieldError
 		if errors.As(err, &fieldErr) && fieldErr != nil {
-			if reason, known := safeFieldReasons[fieldErr.Field]; known && reason == fieldErr.Reason {
+			if reasons, known := safeFieldReasons[fieldErr.Field]; known && slices.Contains(reasons, fieldErr.Reason) {
 				detail = fieldErr.Field + ": " + fieldErr.Reason
 			}
 		}
@@ -34,17 +35,27 @@ func Problem(err error) (int, api.Problem) {
 	}
 }
 
+const (
+	nonZeroUUIDReason = "must be a non-zero UUID"
+	latitudeReason    = "must be between -90 and 90"
+	longitudeReason   = "must be between -180 and 180"
+)
+
 // Only validation messages emitted by domain rules may be exposed. A FieldError
 // from another source must not turn arbitrary field names or reasons into output.
-var safeFieldReasons = map[string]string{
-	"user_id":               "must be a non-zero UUID",
-	"driver_id":             "must be a non-zero UUID",
-	"start_point.latitude":  "must be between -90 and 90",
-	"start_point.longitude": "must be between -180 and 180",
-	"end_point.latitude":    "must be between -90 and 90",
-	"end_point.longitude":   "must be between -180 and 180",
-	"price":                 "must not be negative",
-	"status":                "must be active",
+var safeFieldReasons = map[string][]string{
+	"user_id":               {nonZeroUUIDReason},
+	"driver_id":             {nonZeroUUIDReason},
+	"start_point.latitude":  {latitudeReason},
+	"start_point.longitude": {longitudeReason},
+	"end_point.latitude":    {latitudeReason},
+	"end_point.longitude":   {longitudeReason},
+	"price":                 {"must not be negative"},
+	"status":                {"must be active"},
+	"trip_id":               {nonZeroUUIDReason},
+	"coordinates.latitude":  {latitudeReason},
+	"coordinates.longitude": {longitudeReason},
+	"recorded_at":           {"must be provided", "must not be more than one minute in the future"},
 }
 
 // NewProblem builds a problem with a public, caller-supplied detail.
