@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.uber.org/mock/gomock"
 
 	"github.com/UnusualNick/template/internal/domain"
 	positionworker "github.com/UnusualNick/template/internal/worker/positions"
@@ -40,38 +41,28 @@ func TestLogTripEventIncludesIDOnlyInLog(t *testing.T) {
 	}
 }
 
-type shutdownStaleSource struct {
-	trip     domain.Trip
-	contexts chan context.Context
-}
-
-func (s shutdownStaleSource) ListStale(ctx context.Context, _ time.Time) ([]domain.Trip, error) {
-	s.contexts <- ctx
-	return []domain.Trip{s.trip}, nil
-}
-
-type shutdownRequester struct {
-	entered chan struct{}
-	release <-chan struct{}
-}
-
-func (r shutdownRequester) RequestPosition(ctx context.Context, _, _ uuid.UUID) error {
-	close(r.entered)
-	select {
-	case <-r.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func TestCloseDrainsWorkerBeforeFlushingTelemetry(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	ticks := make(chan time.Time, 1)
-	source := shutdownStaleSource{trip: domain.Trip{ID: uuid.New(), DriverID: uuid.New(), Status: domain.TripStatusActive}, contexts: make(chan context.Context, 1)}
+	trip := domain.Trip{ID: uuid.New(), DriverID: uuid.New(), Status: domain.TripStatusActive}
+	contexts := make(chan context.Context, 1)
+	source := NewMockStaleTrips(gomock.NewController(t))
+	source.EXPECT().ListStale(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, _ time.Time) ([]domain.Trip, error) {
+		contexts <- ctx
+		return []domain.Trip{trip}, nil
+	})
 	entered := make(chan struct{})
 	released := make(chan struct{})
-	requester := shutdownRequester{entered: entered, release: released}
+	requester := NewMockPositionRequester(gomock.NewController(t))
+	requester.EXPECT().RequestPosition(gomock.Any(), trip.ID, trip.DriverID).DoAndReturn(func(ctx context.Context, _, _ uuid.UUID) error {
+		close(entered)
+		select {
+		case <-released:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 	worker, err := positionworker.New(source, requester, positionworker.Config{
 		Interval: time.Minute, StaleAfter: time.Minute, RequestTimeout: 5 * time.Second,
 		Workers: 1, QueueCapacity: 1, Tick: ticks, Logger: logger,
@@ -83,7 +74,7 @@ func TestCloseDrainsWorkerBeforeFlushingTelemetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	ticks <- time.Now()
-	scanCtx := <-source.contexts
+	scanCtx := <-contexts
 	<-entered
 	telemetry := make(chan struct{})
 	app := &App{worker: worker, logger: logger, telemetryShutdown: func(context.Context) error {

@@ -17,14 +17,19 @@
 
 ## Быстрый запуск
 
+Выполните команды ниже **из корня репозитория в одном терминале Bash**. Не запускайте
+`make run` только с `.env`: файл от `tripgoctl` содержит адреса сервисов, но не все
+обязательные для приложения `HTTP_*` (в частности, `HTTP_READ_TIMEOUT`). После
+`tripgoctl environment start` проверьте, что в корне появился `.env`. Сначала
+загрузите значения по умолчанию из `.env.example`, затем перекройте их значениями
+из сгенерированного `.env`. `set -a` экспортирует переменные для `make` и Go.
+
 ```bash
 tripgoctl cluster start
 tripgoctl environment start
 tripgoctl connect
 
-# environment start создаёт .env с актуальными адресами сервисов.
-# Таймауты и прочие значения по умолчанию берём из .env.example,
-# затем настройки окружения курса перекрывают их.
+# Выполняйте в том же Bash-сеансе, в котором затем запустите make:
 set -a
 . ./.env.example
 . ./.env
@@ -33,6 +38,10 @@ set +a
 make migrate
 make run
 ```
+
+Если после `make run` появляется `HTTP_READ_TIMEOUT is required`, загрузите оба
+файла в **том же терминале** в указанном порядке и запустите команду снова.
+`make run` занимает терминал; команды проверки выполните в другом терминале.
 
 Проверка:
 
@@ -71,7 +80,7 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 
 | Команда | Назначение |
 |---|---|
-| `make generate` | обновить HTTP-типы из OpenAPI и GoMock-моки HTTP-действий и юзкейсов |
+| `make generate` | обновить HTTP-типы из OpenAPI и GoMock-моки HTTP-обработчиков, юзкейсов, PostgreSQL, воркера, шлюза Push Service и контейнера |
 | `make migrate` | применить все миграции |
 | `make migrate-down` | откатить все миграции |
 | `make run` | запустить сервис |
@@ -83,14 +92,6 @@ curl -fsS -X POST http://localhost:8080/api/v1/trips/$TRIP_ID/finish
 Для миграций нужен `DATABASE_URL`. Контракт OpenAPI остаётся в
 `contracts/openapi/trip-service.openapi.yaml`; `oapi-codegen.yaml` генерирует
 семь операций: пять из ЛР1 и POST/GET точек маршрута.
-
-## Как сдавать
-
-[ЛР1](https://github.com/UnusualNick/template/pull/1) принята в `main`.
-[ЛР2](https://github.com/UnusualNick/template/pull/2) отправлена из `homework/02`
-в `main` того же форка. ЛР3 выполняется в `homework/03` от обновлённой базы
-PR2; PR3 пока не опубликован. Остальные правила сдачи есть в `grading.md`
-репозитория курса.
 
 ## Конфигурация
 
@@ -272,8 +273,9 @@ PostgreSQL блокирует строку на время обновления.
 устаревших активных поездок. Все миграции имеют `Down`; Goose откатывает их
 в обратном порядке, поэтому внешние ключи не мешают удалить `trips`.
 
-[Проверка телеметрии](<docs/observability.md>) содержит скриншоты Jaeger и
-Grafana, Prometheus-запросы и строку лога с тем же `trace_id`, что и в трейсе.
+[Проверка телеметрии ЛР2](<docs/observability.md>) содержит исторические
+скриншоты Jaeger и Grafana, Prometheus-запросы и строку лога с тем же `trace_id`,
+что и в трейсе. Это не результаты проверки окружения ЛР3.
 
 ## Тесты
 

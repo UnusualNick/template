@@ -29,7 +29,7 @@ lint:
 
 generate:
 	$(GO) tool oapi-codegen --config oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
-	$(GO) generate ./internal/usecase/... ./internal/transport/httpapi/... ./internal/storage/postgres/...
+	$(GO) generate ./internal/usecase/... ./internal/transport/httpapi/... ./internal/storage/postgres/... ./internal/worker/... ./internal/gateway/push/... ./internal/container/...
 
 migrate:
 	@test -n "$(DATABASE_URL)" || (echo "DATABASE_URL is required" >&2; exit 1)

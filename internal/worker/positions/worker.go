@@ -19,6 +19,8 @@ import (
 	"github.com/UnusualNick/template/internal/domain"
 )
 
+//go:generate go run go.uber.org/mock/mockgen -source=worker.go -destination=mocks_test.go -package=positions -mock_names=StaleTrips=MockStaleTrips,PositionRequester=MockPositionRequester
+
 // StaleTrips is owned by this consumer; storage returns only active trips whose
 // most recent position (or start time) precedes before.
 type StaleTrips interface {
@@ -137,7 +139,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 	w.started = true
 	scanCtx, scanStop := context.WithCancel(ctx)
-	workCtx, workStop := context.WithCancel(context.Background())
+	workCtx, workStop := context.WithCancel(context.WithoutCancel(ctx)) // drain after scanner cancellation; preserve context values
 	w.scanStop, w.workStop = scanStop, workStop
 	w.done = make(chan struct{})
 

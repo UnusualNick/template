@@ -182,12 +182,22 @@ func containsTrip(trips []domain.Trip, id uuid.UUID) bool {
 	return false
 }
 
-// EXPLAIN on thousands of real rows checks the expression index is actually
-// usable for the worker's precise predicate and ordering, not merely present.
+// EXPLAIN on thousands of real rows checks whether the normal planner chooses
+// the expression index for the worker's predicate and ordering.
 func TestPositionStaleIndexPlan(t *testing.T) {
 	pool, _, _ := positionTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var hasExpressionStats bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM pg_catalog.pg_statistic_ext
+WHERE stxrelid = 'trips'::regclass AND stxname = 'trips_active_stale_expr_stats'
+AND stxexprs IS NOT NULL)`).Scan(&hasExpressionStats); err != nil {
+		t.Fatal(err)
+	}
+	if !hasExpressionStats {
+		t.Fatal("apply migration 00004: stale-trip expression statistics are required")
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -200,30 +210,43 @@ func TestPositionStaleIndexPlan(t *testing.T) {
 		}
 	}()
 	// Each trip needs a different driver because the active-driver invariant is
-	// enforced in PostgreSQL. IDs are deterministic but contained by rollback.
+	// enforced in PostgreSQL. A unique seed avoids collisions with concurrent runs.
+	// Only 30 of the 3000 active trips qualify; both NULL and non-NULL
+	// last_position_at values exercise the COALESCE expression in the index.
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	seed := uuid.New().String()
 	const fixtures = `INSERT INTO trips (id,user_id,driver_id,start_latitude,start_longitude,end_latitude,end_longitude,price,status,started_at,last_position_at)
-SELECT md5('stale-trip-' || n)::uuid, md5('stale-user-' || n)::uuid, md5('stale-driver-' || n)::uuid,
-0,0,0,0,0,'active',now() - interval '2 hours',
-CASE WHEN n <= 30 THEN now() - interval '2 hours' ELSE now() END
+SELECT md5($2::text || '-stale-trip-' || n)::uuid,
+md5($2::text || '-stale-user-' || n)::uuid,
+md5($2::text || '-stale-driver-' || n)::uuid,
+0,0,0,0,0,'active',$1::timestamptz - interval '2 hours',
+CASE WHEN n <= 15 THEN NULL
+     WHEN n <= 30 THEN $1::timestamptz - interval '1 hour'
+     ELSE $1::timestamptz + interval '30 minutes' END
 FROM generate_series(1, 3000) AS n`
-	if _, err := tx.Exec(ctx, fixtures); err != nil {
+	if _, err := tx.Exec(ctx, fixtures, cutoff, seed); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `ANALYZE trips`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `SET LOCAL enable_bitmapscan = off`); err != nil {
-		t.Fatal(err)
+	// Check that the database allows the planner to choose a sequential or
+	// bitmap scan; otherwise an index plan would not prove index preference.
+	for _, setting := range []string{"enable_seqscan", "enable_bitmapscan"} {
+		var value string
+		if err := tx.QueryRow(ctx, "SHOW "+setting).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "on" {
+			t.Fatalf("%s = %s; index plan requires normal planner settings", setting, value)
+		}
 	}
 	const explain = `EXPLAIN (ANALYZE, BUFFERS)
 SELECT id, user_id, driver_id, start_latitude, start_longitude, end_latitude, end_longitude,
 price, status, started_at, finished_at, last_position_at
 FROM trips WHERE status = 'active' AND COALESCE(last_position_at, started_at) < $1
 ORDER BY COALESCE(last_position_at, started_at), id`
-	rows, err := tx.Query(ctx, explain, time.Now().Add(-time.Hour))
+	rows, err := tx.Query(ctx, explain, cutoff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +265,7 @@ ORDER BY COALESCE(last_position_at, started_at), id`
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("stale query plan over 3000 trips:\n%s", plan.String())
+	t.Logf("unforced stale query plan over 3000 trips (30 stale):\n%s", plan.String())
 	if !strings.Contains(plan.String(), "trips_active_stale_at_idx") {
 		t.Fatalf("stale query did not use partial expression index:\n%s", plan.String())
 	}

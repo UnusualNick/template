@@ -381,24 +381,6 @@ func TestGeneratedRoutesGiveActiveMetricTemplate(t *testing.T) {
 	t.Fatal("no balanced active-request metric with generated route template")
 }
 
-type positionSaveStub struct{ position domain.TripPosition }
-
-func (s positionSaveStub) Execute(_ context.Context, id uuid.UUID, input domain.CreatePosition) (domain.TripPosition, error) {
-	if id != s.position.TripID || input.Coordinates != s.position.Coordinates || !input.RecordedAt.Equal(s.position.RecordedAt) {
-		return domain.TripPosition{}, fmt.Errorf("incorrect position request: %v %v", id, input)
-	}
-	return s.position, nil
-}
-
-type positionListStub struct{ position domain.TripPosition }
-
-func (s positionListStub) Execute(_ context.Context, id uuid.UUID) ([]domain.TripPosition, error) {
-	if id != s.position.TripID {
-		return nil, fmt.Errorf("incorrect trip ID: %s", id)
-	}
-	return []domain.TripPosition{s.position}, nil
-}
-
 func TestPositionRoutesUseGeneratedRouter(t *testing.T) {
 	id := uuid.MustParse("1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111")
 	position := domain.TripPosition{
@@ -406,9 +388,15 @@ func TestPositionRoutesUseGeneratedRouter(t *testing.T) {
 		RecordedAt: time.Date(2026, 8, 24, 12, 0, 5, 0, time.UTC),
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	save := NewMockPositionSaveUsecase(gomock.NewController(t))
+	save.EXPECT().Execute(gomock.Any(), id, domain.CreatePosition{
+		Coordinates: position.Coordinates, RecordedAt: position.RecordedAt,
+	}).Return(position, nil)
+	list := NewMockPositionListUsecase(gomock.NewController(t))
+	list.EXPECT().Execute(gomock.Any(), id).Return([]domain.TripPosition{position}, nil)
 	handler := NewHandler(testService(t), testPinger(t), time.Second, logger, PositionHandlers{
-		Create: httppositions.NewCreate(positionSaveStub{position: position}),
-		List:   httppositions.NewList(positionListStub{position: position}),
+		Create: httppositions.NewCreate(save),
+		List:   httppositions.NewList(list),
 	})
 	router := NewRouter(handler)
 	path := "/api/v1/trips/" + id.String() + "/positions"

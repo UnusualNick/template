@@ -1,18 +1,17 @@
 package positions
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/mock/gomock"
 
 	"github.com/UnusualNick/template/api"
 	"github.com/UnusualNick/template/internal/domain"
@@ -22,16 +21,14 @@ const validBody = `{"coordinates":{"latitude":59.9343,"longitude":30.3351},"reco
 
 var tripID = uuid.MustParse("1f0a9c62-4a1c-4f2e-9d33-2a4bb0f0b111")
 
-type saveStub func(context.Context, uuid.UUID, domain.CreatePosition) (domain.TripPosition, error)
-
-func (f saveStub) Execute(ctx context.Context, id uuid.UUID, input domain.CreatePosition) (domain.TripPosition, error) {
-	return f(ctx, id, input)
+func failSave(t *testing.T) *MockSaveUsecase {
+	t.Helper()
+	return NewMockSaveUsecase(gomock.NewController(t)) // no calls expected
 }
 
-type listStub func(context.Context, uuid.UUID) ([]domain.TripPosition, error)
-
-func (f listStub) Execute(ctx context.Context, id uuid.UUID) ([]domain.TripPosition, error) {
-	return f(ctx, id)
+func failList(t *testing.T) *MockListUsecase {
+	t.Helper()
+	return NewMockListUsecase(gomock.NewController(t)) // no calls expected
 }
 
 func post(body, contentType string, id uuid.UUID, usecase saveUsecase) *httptest.ResponseRecorder {
@@ -49,22 +46,6 @@ func get(id uuid.UUID, usecase listUsecase) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	NewList(usecase).Handle(w, r, id)
 	return w
-}
-
-func failSave(t *testing.T) saveStub {
-	t.Helper()
-	return func(context.Context, uuid.UUID, domain.CreatePosition) (domain.TripPosition, error) {
-		t.Fatal("save usecase called for invalid request")
-		return domain.TripPosition{}, nil
-	}
-}
-
-func failList(t *testing.T) listStub {
-	t.Helper()
-	return func(context.Context, uuid.UUID) ([]domain.TripPosition, error) {
-		t.Fatal("list usecase called for invalid request")
-		return nil, nil
-	}
 }
 
 func assertProblem(t *testing.T, w *httptest.ResponseRecorder, status int, code, detail string, id uuid.UUID) {
@@ -91,12 +72,9 @@ func TestCreateSuccess(t *testing.T) {
 			if strings.Contains(body, `"latitude":0`) {
 				input.Coordinates = domain.Coordinates{}
 			}
-			w := post(body, "application/json; charset=UTF-8", tripID, saveStub(func(ctx context.Context, id uuid.UUID, got domain.CreatePosition) (domain.TripPosition, error) {
-				if ctx == nil || id != tripID || !reflect.DeepEqual(got, input) {
-					t.Fatalf("got id %s, input %#v; want id %s, input %#v", id, got, tripID, input)
-				}
-				return position, nil
-			}))
+			usecase := NewMockSaveUsecase(gomock.NewController(t))
+			usecase.EXPECT().Execute(gomock.Any(), tripID, input).Return(position, nil)
+			w := post(body, "application/json; charset=UTF-8", tripID, usecase)
 			if w.Code != http.StatusCreated || w.Header().Get("Content-Type") != "application/json" {
 				t.Fatalf("status = %d, headers = %v, body = %s", w.Code, w.Header(), w.Body.String())
 			}
@@ -122,7 +100,10 @@ func TestCreateInvalidBody(t *testing.T) {
 		{"missing timestamp", strings.Replace(validBody, `,"recorded_at":"2026-09-01T10:05:00Z"`, "", 1), `required field "recorded_at" is missing`},
 		{"null timestamp", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":null`, 1), `required field "recorded_at" is missing`},
 		{"invalid timestamp", strings.Replace(validBody, "2026-09-01T10:05:00Z", "private-not-a-time", 1), "request body contains an invalid field value"},
-		{"wrong timestamp type", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":123`, 1), "request body contains an invalid field value"},
+		{"numeric timestamp", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":123`, 1), "request body contains an invalid field value"},
+		{"boolean timestamp", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":true`, 1), "request body contains an invalid field value"},
+		{"array timestamp", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":[]`, 1), "request body contains an invalid field value"},
+		{"object timestamp", strings.Replace(validBody, `"recorded_at":"2026-09-01T10:05:00Z"`, `"recorded_at":{}`, 1), "request body contains an invalid field value"},
 		{"unknown top field", strings.Replace(validBody, `"recorded_at":`, `"private_secret":true,"recorded_at":`, 1), "request body contains an unknown field"},
 		{"unknown nested field", strings.Replace(validBody, `"latitude":59.9343`, `"private_secret":true,"latitude":59.9343`, 1), "request body contains an unknown field"},
 		{"wrong latitude type", strings.Replace(validBody, `"latitude":59.9343`, `"latitude":"private"`, 1), "request body contains a field with the wrong type"},
@@ -166,12 +147,9 @@ func TestCreateUsecaseErrors(t *testing.T) {
 		{"backend", errors.New("private database credentials"), http.StatusInternalServerError, "internal_error", "An internal error occurred"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w := post(validBody, "application/json", tripID, saveStub(func(_ context.Context, id uuid.UUID, _ domain.CreatePosition) (domain.TripPosition, error) {
-				if id != tripID {
-					t.Fatalf("trip id = %s", id)
-				}
-				return domain.TripPosition{}, tc.err
-			}))
+			usecase := NewMockSaveUsecase(gomock.NewController(t))
+			usecase.EXPECT().Execute(gomock.Any(), tripID, gomock.Any()).Return(domain.TripPosition{}, tc.err)
+			w := post(validBody, "application/json", tripID, usecase)
 			assertProblem(t, w, tc.status, tc.code, tc.detail, tripID)
 			if strings.Contains(w.Body.String(), "private") {
 				t.Fatalf("private error leaked: %s", w.Body.String())
@@ -185,12 +163,9 @@ func TestListSuccessAndErrors(t *testing.T) {
 	last := domain.TripPosition{ID: 2, TripID: tripID, Coordinates: domain.Coordinates{Latitude: 3, Longitude: 4}, RecordedAt: first.RecordedAt.Add(time.Minute)}
 	for _, positions := range [][]domain.TripPosition{nil, {}, {first, last}} {
 		t.Run(fmt.Sprintf("%d positions", len(positions)), func(t *testing.T) {
-			w := get(tripID, listStub(func(ctx context.Context, id uuid.UUID) ([]domain.TripPosition, error) {
-				if ctx == nil || id != tripID {
-					t.Fatalf("id = %s", id)
-				}
-				return positions, nil
-			}))
+			usecase := NewMockListUsecase(gomock.NewController(t))
+			usecase.EXPECT().Execute(gomock.Any(), tripID).Return(positions, nil)
+			w := get(tripID, usecase)
 			if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" {
 				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 			}
@@ -217,7 +192,9 @@ func TestListSuccessAndErrors(t *testing.T) {
 		{domain.ErrTripNotFound, http.StatusNotFound, "trip_not_found", "Trip was not found"},
 		{errors.New("private database credentials"), http.StatusInternalServerError, "internal_error", "An internal error occurred"},
 	} {
-		w := get(tripID, listStub(func(context.Context, uuid.UUID) ([]domain.TripPosition, error) { return nil, tc.err }))
+		usecase := NewMockListUsecase(gomock.NewController(t))
+		usecase.EXPECT().Execute(gomock.Any(), tripID).Return(nil, tc.err)
+		w := get(tripID, usecase)
 		assertProblem(t, w, tc.status, tc.code, tc.detail, tripID)
 		if strings.Contains(w.Body.String(), "private") {
 			t.Fatalf("private error leaked: %s", w.Body.String())

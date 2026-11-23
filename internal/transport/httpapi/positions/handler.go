@@ -108,6 +108,12 @@ func decodePositionData(reader io.Reader) (api.PositionData, error) {
 			return api.PositionData{}, requestValidationError(fmt.Sprintf("required field %q is missing", name))
 		}
 	}
+	// A timestamp must be a JSON string. Different Go versions classify other
+	// JSON types as either a time parsing error or an unmarshal type error.
+	timestamp := bytes.TrimSpace(fields["recorded_at"])
+	if len(timestamp) == 0 || timestamp[0] != '"' {
+		return api.PositionData{}, requestValidationError("request body contains an invalid field value")
+	}
 	var coordinates map[string]json.RawMessage
 	if err := json.Unmarshal(fields["coordinates"], &coordinates); err != nil || coordinates == nil {
 		return api.PositionData{}, requestValidationError(`field "coordinates" must be a JSON object`)

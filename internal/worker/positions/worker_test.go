@@ -17,20 +17,25 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.uber.org/goleak"
+	"go.uber.org/mock/gomock"
 
 	"github.com/UnusualNick/template/internal/domain"
 )
 
-type staleFunc func(context.Context, time.Time) ([]domain.Trip, error)
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
-func (f staleFunc) ListStale(ctx context.Context, before time.Time) ([]domain.Trip, error) {
-	return f(ctx, before)
+func mockStale(t *testing.T, fn func(context.Context, time.Time) ([]domain.Trip, error)) *MockStaleTrips {
+	t.Helper()
+	mock := NewMockStaleTrips(gomock.NewController(t))
+	mock.EXPECT().ListStale(gomock.Any(), gomock.Any()).DoAndReturn(fn).AnyTimes()
+	return mock
 }
 
-type requestFunc func(context.Context, uuid.UUID, uuid.UUID) error
-
-func (f requestFunc) RequestPosition(ctx context.Context, tripID, driverID uuid.UUID) error {
-	return f(ctx, tripID, driverID)
+func mockRequester(t *testing.T, fn func(context.Context, uuid.UUID, uuid.UUID) error) *MockPositionRequester {
+	t.Helper()
+	mock := NewMockPositionRequester(gomock.NewController(t))
+	mock.EXPECT().RequestPosition(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(fn).AnyTimes()
+	return mock
 }
 
 func trip() domain.Trip { return domain.Trip{ID: uuid.New(), DriverID: uuid.New()} }
@@ -94,13 +99,13 @@ func TestScannerQueueDedupDropAndDrain(t *testing.T) {
 			}
 		},
 	}
-	w, err := New(staleFunc(func(_ context.Context, before time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(_ context.Context, before time.Time) ([]domain.Trip, error) {
 		scanned <- before
 		if calls.Add(1) == 1 {
 			return []domain.Trip{a}, nil
 		}
 		return []domain.Trip{b, b, c}, nil
-	}), requestFunc(func(ctx context.Context, tripID, driverID uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, tripID, driverID uuid.UUID) error {
 		entered <- tripID
 		switch tripID {
 		case a.ID:
@@ -171,10 +176,10 @@ func TestPositionArrivalCancelsActiveAndOldTokenCannotDeleteNew(t *testing.T) {
 			queued <- struct{}{}
 		}
 	}
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		scanned <- struct{}{}
 		return []domain.Trip{b}, nil
-	}), requestFunc(func(ctx context.Context, _, _ uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
 		started <- ctx
 		if count.Add(1) == 1 {
 			<-allowFirst // models a gateway returning after cancellation
@@ -219,12 +224,12 @@ func TestPositionArrivalSkipsQueuedEntry(t *testing.T) {
 			queued <- struct{}{}
 		}
 	}
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		if scans.Add(1) == 1 {
 			return []domain.Trip{a}, nil
 		}
 		return []domain.Trip{b}, nil
-	}), requestFunc(func(_ context.Context, tripID, _ uuid.UUID) error {
+	}), mockRequester(t, func(_ context.Context, tripID, _ uuid.UUID) error {
 		started <- tripID
 		if tripID == a.ID {
 			<-release
@@ -254,16 +259,51 @@ func TestPositionArrivalSkipsQueuedEntry(t *testing.T) {
 	}
 }
 
+func TestScannerCancellationDrainsRequestsAndPreservesContextValues(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	type contextKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "request-value"))
+	defer cancel()
+	ticks := make(chan time.Time)
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	cfg := testConfig(ticks)
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
+		return []domain.Trip{trip()}, nil
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
+		started <- ctx
+		<-release
+		return ctx.Err()
+	}), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ticks <- time.Time{}
+	requestCtx := receive(t, started)
+	cancel() // stop scanning without canceling the in-flight drain
+	if got := requestCtx.Value(contextKey{}); got != "request-value" {
+		t.Errorf("request context value = %v", got)
+	}
+	if err := requestCtx.Err(); err != nil {
+		t.Errorf("request canceled with scanner: %v", err)
+	}
+	close(release)
+	stopWorker(t, w)
+}
+
 func TestStopDeadlineCancelsRequestsAndNoGoroutinesRemain(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	ticks := make(chan time.Time)
 	started := make(chan context.Context, 1)
 	scanned := make(chan struct{}, 1)
 	cfg := testConfig(ticks)
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		scanned <- struct{}{}
 		return []domain.Trip{trip()}, nil
-	}), requestFunc(func(ctx context.Context, _, _ uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
 		started <- ctx
 		<-ctx.Done()
 		return ctx.Err()
@@ -310,9 +350,9 @@ func TestFixedWorkerCountAndRequestTimeout(t *testing.T) {
 			t.Errorf("active worker gauge exceeds configured count: %d", n)
 		}
 	}
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		return trips, nil
-	}), requestFunc(func(ctx context.Context, _, _ uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
 		n := running.Add(1)
 		for {
 			old := peak.Load()
@@ -359,9 +399,9 @@ func TestFixedWorkerCountAndRequestTimeout(t *testing.T) {
 	cfg.RequestTimeout = 20 * time.Millisecond
 	completed := make(chan string, 1)
 	cfg.Hooks.OnRequest = func(result string, _ time.Duration) { completed <- result }
-	w, err = New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err = New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		return []domain.Trip{trip()}, nil
-	}), requestFunc(func(ctx context.Context, _, _ uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}), cfg)
@@ -401,12 +441,12 @@ func TestScannerLinkToAsyncRequestAndRedactedErrors(t *testing.T) {
 	cfg.Hooks.OnRequest = func(string, time.Duration) { requested <- struct{}{} }
 	var scanCount atomic.Int32
 	item := trip()
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		if scanCount.Add(1) == 1 {
 			return nil, errors.New("postgres://user:secret@host/database")
 		}
 		return []domain.Trip{item}, nil
-	}), requestFunc(func(ctx context.Context, _, _ uuid.UUID) error {
+	}), mockRequester(t, func(ctx context.Context, _, _ uuid.UUID) error {
 		_, pushSpan := otel.Tracer("test-gateway").Start(ctx, "gateway.push")
 		pushSpan.End()
 		return errors.New("secret outbound payload")
@@ -464,14 +504,14 @@ func TestScannerLinkToAsyncRequestAndRedactedErrors(t *testing.T) {
 func TestStartValidationAndSingleScanner(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	cfg := testConfig(make(chan time.Time))
-	if _, err := New(nil, requestFunc(func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg); err == nil {
+	if _, err := New(nil, mockRequester(t, func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg); err == nil {
 		t.Fatal("missing source accepted")
 	}
-	if _, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) { return nil, nil }), nil, cfg); err == nil {
+	if _, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) { return nil, nil }), nil, cfg); err == nil {
 		t.Fatal("missing requester accepted")
 	}
 	cfg.QueueCapacity = 0
-	if _, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) { return nil, nil }), requestFunc(func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg); err == nil {
+	if _, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) { return nil, nil }), mockRequester(t, func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg); err == nil {
 		t.Fatal("zero capacity accepted")
 	}
 	cfg.QueueCapacity = 1
@@ -480,7 +520,7 @@ func TestStartValidationAndSingleScanner(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	var active, max atomic.Int32
-	w, err := New(staleFunc(func(context.Context, time.Time) ([]domain.Trip, error) {
+	w, err := New(mockStale(t, func(context.Context, time.Time) ([]domain.Trip, error) {
 		n := active.Add(1)
 		if n > max.Load() {
 			max.Store(n)
@@ -492,7 +532,7 @@ func TestStartValidationAndSingleScanner(t *testing.T) {
 		<-release
 		active.Add(-1)
 		return nil, errors.New("scan failure")
-	}), requestFunc(func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg)
+	}), mockRequester(t, func(context.Context, uuid.UUID, uuid.UUID) error { return nil }), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

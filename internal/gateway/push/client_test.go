@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/mock/gomock"
 )
 
 func TestRequestPositionAccepted(t *testing.T) {
@@ -179,17 +179,14 @@ func TestRequestPositionFailureSpanRedactsBody(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 func TestRequestPositionTransportTimeoutAndContext(t *testing.T) {
 	var calls atomic.Int32
-	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	transport := NewMockRoundTripper(gomock.NewController(t))
+	transport.EXPECT().RoundTrip(gomock.Any()).DoAndReturn(func(r *http.Request) (*http.Response, error) {
 		calls.Add(1)
 		<-r.Context().Done()
 		return nil, r.Context().Err()
-	})
+	}).AnyTimes()
 	client, err := New("http://push.example", 15*time.Millisecond, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
@@ -221,9 +218,11 @@ func (b *trackedBody) Close() error { b.closed = true; return nil }
 func TestRequestPositionDrainsAndClosesResponse(t *testing.T) {
 	for _, status := range []int{http.StatusAccepted, http.StatusBadRequest} {
 		body := &trackedBody{Reader: strings.NewReader("response to drain")}
-		client, err := New("http://push.example", time.Second, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		transport := NewMockRoundTripper(gomock.NewController(t))
+		transport.EXPECT().RoundTrip(gomock.Any()).DoAndReturn(func(r *http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: status, Body: body, Header: make(http.Header), Request: r}, nil
-		})})
+		})
+		client, err := New("http://push.example", time.Second, &http.Client{Transport: transport})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -249,9 +248,11 @@ func (b *contextBody) Close() error { b.closed = true; return nil }
 
 func TestRequestPositionCapsResponseDrain(t *testing.T) {
 	body := &trackedBody{Reader: strings.NewReader(strings.Repeat("x", maxResponseDrain+1))}
-	client, err := New("http://push.example", time.Second, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	transport := NewMockRoundTripper(gomock.NewController(t))
+	transport.EXPECT().RoundTrip(gomock.Any()).DoAndReturn(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusAccepted, Body: body, Header: make(http.Header), Request: r}, nil
-	})})
+	})
+	client, err := New("http://push.example", time.Second, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,10 +267,12 @@ func TestRequestPositionCapsResponseDrain(t *testing.T) {
 
 func TestRequestPositionTimeoutDuringBodyClosesResponse(t *testing.T) {
 	var body *contextBody
-	client, err := New("http://push.example", 15*time.Millisecond, &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	transport := NewMockRoundTripper(gomock.NewController(t))
+	transport.EXPECT().RoundTrip(gomock.Any()).DoAndReturn(func(r *http.Request) (*http.Response, error) {
 		body = &contextBody{ctx: r.Context()}
 		return &http.Response{StatusCode: http.StatusAccepted, Body: body, Header: make(http.Header), Request: r}, nil
-	})})
+	})
+	client, err := New("http://push.example", 15*time.Millisecond, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,9 +312,8 @@ func TestNewValidatesInputsWithoutChangingProvidedClient(t *testing.T) {
 	if _, err := New("http://push.example", 0); err == nil {
 		t.Error("accepted missing timeout")
 	}
-	original := &http.Client{Timeout: 2 * time.Minute, Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
+	transport := NewMockRoundTripper(gomock.NewController(t))
+	original := &http.Client{Timeout: 2 * time.Minute, Transport: transport}
 	client, err := New("http://push.example", time.Second, original)
 	if err != nil || original.Timeout != 2*time.Minute || client.http.Timeout != time.Second {
 		t.Fatalf("provided client mutated or timeout not applied: %v", err)
